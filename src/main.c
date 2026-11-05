@@ -29,7 +29,7 @@ enum { VIEW_HIDDEN, VIEW_SHIPS, VIEW_END };     /* what a board shows of its fle
 #define ICON_X (PANEL_X + 63)   /* odd, so tools/e2e.py pins gfx_blit's odd-x path on a real pixel */
 #define START_Y 133             /* the PRESS START on the title */
 #define SPLASH_FRAMES 300       /* the win or lose art's hold, as on GB: 5 seconds */
-#define SPLASH_LOCK 36          /* no skipping until the jingle is over, so mashing the last shot's A cannot */
+#define SPLASH_LOCK 36          /* no skipping at first, so mashing the last shot's A cannot throw the picture away. A later skip cuts the jingle */
 #define THINK_FRAMES 30         /* the enemy's pause; the AI runs inside it */
 #define SEA_RATE 8              /* frames per step of the sea's 16: a wave passes in about 2 seconds */
 #define SHELL_FRAMES 24         /* a shell's flight */
@@ -80,6 +80,8 @@ volatile u32 worst_frame;       /* the most cycles a frame's work has taken so f
 u16 samples, sample_tries;      /* ADMIRAL's last turn: valid fleets, and fleets tried */
 u8 think_frames;                /* frames the enemy's last turn spent thinking */
 volatile u32 cells_drawn;
+volatile u32 jingle_notes;      /* notes started on any channel, ever */
+volatile u32 music_cycles;      /* the most cycles music_step has taken in the VBlank handler */
 Board pb, ob;                   /* your waters, enemy waters */
 u8 ai_level = 1;
 u8 cx, cy;
@@ -190,9 +192,12 @@ static void sync_boards(void)
 }
 
 /* ---------------------------------------------------------------- frame */
+static void music_step(void);
+
 static void on_vbl(void)
 {
     int k;
+    u32 c;
     frames++;
     if (!work_done) frame_drops++;  /* this VBlank came before the frame's work ended */
     work_done = 0;
@@ -203,6 +208,10 @@ static void on_vbl(void)
     /* ponytail: index 0 is also the backdrop, so one step of water goes dark for the length of a shake.
        Remap the sea off index 0 if it ever shows. */
     if (shaking) pal_bg_mem[0] = art_shared_pal[C_BG];
+    c = cycles();
+    music_step();
+    c = cycles() - c;
+    if (c > music_cycles) music_cycles = c;
 }
 
 /* ---------------------------------------------------------------- animation */
@@ -437,13 +446,22 @@ static void panel_line(const Board *b, int s)
 }
 
 /* ---------------------------------------------------------------- sound */
-/* The GB's channel 4 and channel 1 values: on the GBA the envelope is the high byte of
-   SND4CNT/SND1CNT, the noise clock the low byte of SND4FREQ, and the note codes are the same. */
+/* Effects: CH4 only, and each writes its whole setup every time. Music never touches CH4. */
 static void sound_init(void)
 {
     REG_SNDSTAT = 0x80;         /* PSG on (must be first) */
-    REG_SNDDMGCNT = 0xFF77;     /* all channels both sides, max volume */
-    REG_SNDDSCNT = 2;           /* DMG mix 100% */
+    /* All channels both sides, master 7. Each PSG channel spans a quarter of the output, so all four at
+       full volume just reach the top: the PSG can't clip against itself. */
+    REG_SNDDMGCNT = 0xFF77;
+    /* Bits 0-1: PSG mix 100%. Direct Sound's bits are clear, ready for Phase 8 to add. */
+    REG_SNDDSCNT = 2;
+    REG_SND1SWEEP = 0;          /* never swept */
+    /* CH3's wave, once only and with the channel off: writing wave RAM while CH3 plays is the classic
+       bug. Bank 1 is selected, so the writes fill bank 0, which is the one a note plays. */
+    REG_SND3SEL = 0x40;
+    REG_WAVE_RAM0 = 0x67452301; REG_WAVE_RAM1 = 0xEFCDAB89;     /* a triangle: 0..F */
+    REG_WAVE_RAM2 = 0x98BADCFE; REG_WAVE_RAM3 = 0x10325476;     /* and back down */
+    REG_SND3SEL = 0;
 }
 
 static void sound_explosion(int big_one)
@@ -458,8 +476,129 @@ static void sound_tick(void)
     REG_SND4FREQ = 0x8071;
 }
 
-static const u16 jingle_win[4] = { 1797, 1849, 1881, 1922 };    /* C5 E5 G5 C6 */
-static const u16 jingle_lose[4] = { 1797, 1713, 1650, 1546 };   /* C5 G4 E4 C4 */
+/* Music: CH1 melody, CH2 harmony, CH3 bass. A tune is three lists of notes, one entry per row, all stepped
+   by one index, so they can't drift while they are the same length (tools/e2e.py checks that, and each
+   tune's bars). A row is t->rate frames. _ lets the note ring on, REST silences the channel. */
+enum {
+    _, REST,
+    C2, Db2, D2, Eb2, E2, F2, Gb2, G2, Ab2, A2, Bb2, B2,
+    C3, Db3, D3, Eb3, E3, F3, Gb3, G3, Ab3, A3, Bb3, B3,
+    C4, Db4, D4, Eb4, E4, F4, Gb4, G4, Ab4, A4, Bb4, B4,
+    C5, Db5, D5, Eb5, E5, F5, Gb5, G5, Ab5, A5, Bb5, B5,
+    C6, Db6, D6, Eb6, E6, F6, Gb6, G6, Ab6, A6, Bb6, B6,
+    END = 0xFF
+};
+/* A square channel's frequency register for each note, from 131072 / Hz in the lowest octave. CH3 plays 32
+   samples a cycle, half as fast for the same value, so it reads this table an octave up. */
+#define OCTAVE(s) 2048 - (2004 >> s), 2048 - (1892 >> s), 2048 - (1785 >> s), 2048 - (1685 >> s), 2048 - (1591 >> s), 2048 - (1501 >> s), \
+                  2048 - (1417 >> s), 2048 - (1337 >> s), 2048 - (1262 >> s), 2048 - (1192 >> s), 2048 - (1125 >> s), 2048 - (1062 >> s)
+const u16 note_reg[] = { OCTAVE(0), OCTAVE(1), OCTAVE(2), OCTAVE(3), OCTAVE(4), OCTAVE(5) };
+
+typedef struct { const u8 *voice[3]; u8 rate, loop; u16 cnt1, cnt2, cnt3; } Tune;
+
+/* The title: 16 bars of 6/8 in G with a flat seventh, a bar a second. A horn-like fifth, rocking bass. */
+static const u8 title_1[] = {
+    G4, _, _, D5, _, _,    C5, _, D5, A4, _, _,   B4, _, D5, G5, _, _,    F5, _, E5, D5, _, _,
+    G4, _, _, D5, _, _,    C5, _, D5, F5, _, _,   E5, _, D5, C5, _, A4,   B4, _, A4, G4, _, _,
+    E5, _, G5, B5, _, _,   A5, _, G5, E5, _, _,   A4, _, C5, E5, _, _,    D5, _, F5, A5, _, _,
+    G5, _, E5, C5, _, _,   F5, _, D5, C5, _, A4,  B4, _, A4, D5, _, _,    G4, _, _, D4, _, _, END };
+static const u8 title_2[] = {
+    D4, _, _, G4, _, _,    F4, _, _, F4, _, _,    G4, _, _, B4, _, _,     A4, _, _, F4, _, _,
+    D4, _, _, G4, _, _,    F4, _, _, A4, _, _,    G4, _, _, E4, _, _,     G4, _, _, D4, _, _,
+    G4, _, _, E5, _, _,    C5, _, _, A4, _, _,    E4, _, _, A4, _, _,     F4, _, _, D5, _, _,
+    C5, _, _, G4, _, _,    A4, _, _, F4, _, _,    G4, _, _, B4, _, _,     D4, _, _, B3, _, _, END };
+static const u8 title_3[] = {
+    G2, _, _, D3, _, _,    F2, _, _, C3, _, _,    G2, _, _, D3, _, _,     D3, _, _, A2, _, _,
+    G2, _, _, D3, _, _,    F2, _, _, C3, _, _,    C3, _, _, G2, _, _,     G2, _, D3, G2, _, _,
+    E3, _, _, B2, _, _,    A2, _, _, E3, _, _,    A2, _, _, E3, _, _,     D3, _, _, A2, _, _,
+    C3, _, _, G2, _, _,    F2, _, _, C3, _, _,    G2, _, _, D3, _, _,     G2, _, _, D3, _, _, END };
+/* Battle: 12 bars of 8 slow rows, 32 s. A heartbeat of bass, and a few quiet notes between long rests. */
+static const u8 battle_1[] = {
+    _, _, _, _, _, _, _, _,    _, _, _, _, A4, _, _, _,    _, _, _, _, _, _, _, _,    _, _, _, _, Bb4, _, A4, _,
+    _, _, _, _, _, _, _, _,    _, _, _, _, C5, _, Bb4, _,  A4, _, _, _, _, _, _, _,   _, _, _, _, _, _, _, _,
+    _, _, _, _, F4, _, E4, _,  _, _, _, _, _, _, _, _,     _, _, _, _, E4, _, D4, _,  _, _, _, _, _, _, _, _, END };
+static const u8 battle_2[] = {
+    _, _, _, _, _, _, _, _,    _, _, _, _, _, _, _, _,     D4, _, _, _, _, _, _, _,   _, _, _, _, _, _, _, _,
+    F4, _, _, _, _, _, _, _,   _, _, _, _, _, _, _, _,     E4, _, _, _, _, _, _, _,   _, _, _, _, _, _, _, _,
+    Bb3, _, _, _, _, _, _, _,  _, _, _, _, _, _, _, _,     A3, _, _, _, _, _, _, _,   _, _, _, _, _, _, _, _, END };
+static const u8 battle_3[] = {
+    D3, _, REST, _, _, _, _, _,   D3, _, REST, _, A2, _, REST, _,   D3, _, REST, _, _, _, _, _,   D3, _, REST, _, A2, _, REST, _,
+    D3, _, REST, _, _, _, _, _,   D3, _, REST, _, A2, _, REST, _,   D3, _, REST, _, _, _, _, _,   D3, _, REST, _, A2, _, REST, _,
+    Bb2, _, REST, _, _, _, _, _,  Bb2, _, REST, _, F2, _, REST, _,  A2, _, REST, _, _, _, _, _,   A2, _, REST, _, E3, _, REST, _, END };
+/* Win: up the call and over the top, 3.2 s. Lose: down and down, 4 s. Both inside the picture's 5 s. */
+static const u8 win_1[] = {
+    G4, _, B4, D5, _, G5,   F5, _, D5, G5, _, A5,   B5, _, _, G5, _, D5,   G5, _, _, _, _, _, END };
+static const u8 win_2[] = {
+    D4, _, G4, B4, _, D5,   C5, _, A4, D5, _, F5,   G5, _, _, D5, _, B4,   B4, _, _, _, _, _, END };
+static const u8 win_3[] = {
+    G2, _, _, D3, _, _,     F2, _, _, G2, _, _,     G2, _, _, D3, _, _,    G2, _, _, _, REST, _, END };
+static const u8 lose_1[] = {
+    E5, _, D5, C5, _, A4,   B4, _, G4, A4, _, F4,   E4, _, _, D4, _, C4,   A3, _, _, _, _, _, END };
+static const u8 lose_2[] = {
+    C5, _, B4, A4, _, F4,   G4, _, E4, F4, _, D4,   C4, _, _, B3, _, A3,   E3, _, _, _, _, _, END };
+static const u8 lose_3[] = {
+    A2, _, _, F2, _, _,     G2, _, _, D3, _, _,     A2, _, _, E2, _, _,    A2, _, _, _, REST, _, END };
+
+/* The envelopes: volume nibble, then decay. CH3: 0x4000 is 50%, 0x6000 is 25%. Battle's are the quiet ones. */
+const Tune tune_title  = { { title_1, title_2, title_3 },    10, 1, 0xA480, 0x6540, 0x4000 };
+const Tune tune_battle = { { battle_1, battle_2, battle_3 }, 20, 1, 0x4780, 0x3780, 0x6000 };
+const Tune tune_win    = { { win_1, win_2, win_3 },           8, 0, 0xC480, 0x8540, 0x4000 };
+const Tune tune_lose   = { { lose_1, lose_2, lose_3 },       10, 0, 0xA480, 0x6540, 0x4000 };
+
+const Tune *volatile music;     /* NULL: none. Set last and cleared first, so VBlank never sees half a change */
+volatile u16 music_row, music_wait;
+u16 music_last[3];              /* each channel's frequency value last written, 0 if silenced: those registers can't be read back */
+
+/* Off, each by its own way, and the notes in hand with them. An effect on CH4 is not touched. Retriggering at
+   envelope volume 0 turns a square channel off. */
+static void music_stop(void)
+{
+    music = NULL;
+    REG_SND1CNT = 0; REG_SND1FREQ = 0x8000;
+    REG_SND2CNT = 0; REG_SND2FREQ = 0x8000;
+    REG_SND3SEL = 0;
+    music_last[0] = music_last[1] = music_last[2] = 0;
+}
+
+static void music_play(const Tune *t)
+{
+    music_stop();
+    music_row = 0;
+    music_wait = 1;
+    music = t;
+}
+
+/* From the VBlank handler, so nothing waits on it. Each note writes its channel's whole setup. */
+static void music_step(void)
+{
+    const Tune *t = music;
+    int n, r;
+    if (!t || --music_wait) return;
+    music_wait = t->rate;
+    r = music_row;
+    if (t->voice[0][r] == END) {
+        if (!t->loop) { music_stop(); return; }
+        r = 0;
+    }
+    music_row = r + 1;
+    if ((n = t->voice[0][r]) != _) {
+        REG_SND1CNT = n == REST ? 0 : t->cnt1;
+        REG_SND1FREQ = 0x8000 | (music_last[0] = n == REST ? 0 : note_reg[n - C2]);
+        if (n != REST) jingle_notes++;
+    }
+    if ((n = t->voice[1][r]) != _) {
+        REG_SND2CNT = n == REST ? 0 : t->cnt2;
+        REG_SND2FREQ = 0x8000 | (music_last[1] = n == REST ? 0 : note_reg[n - C2]);
+        if (n != REST) jingle_notes++;
+    }
+    if ((n = t->voice[2][r]) == REST) { REG_SND3SEL = 0; music_last[2] = 0; }
+    else if (n != _) {
+        REG_SND3SEL = 0x80;
+        REG_SND3CNT = t->cnt3;
+        REG_SND3FREQ = 0x8000 | (music_last[2] = note_reg[n - C2 + 12]);
+        jingle_notes++;
+    }
+}
 
 /* ---------------------------------------------------------------- input */
 /* The direction to step this frame: at once on a press, then the GB's repeat. */
@@ -504,6 +643,7 @@ static void menu_level(void)
 static int menu(void)
 {
     fade(1);
+    music_stop();               /* the title tune, under black. Menu is silent */
     clear_screen();
     wait_frame();
     text_mid(40, "NAVAL HUNTER", C_INK);
@@ -555,11 +695,13 @@ static void place_fleet(void)
         wait_frame();
 
         if (key_hit(KEY_START)) {       /* randomise the rest */
+            big.b = NULL;               /* the board holds still until the battle clears it */
             for (; place_s < NSHIP; place_s++) {
                 /* Failing is very unlikely, after a tight manual layout. The list then shows
                    a ship short, and alive must agree or that ship could never be sunk. */
                 if (!place_random_one(&pb, place_s)) pb.alive--;
                 panel_line(&pb, place_s);
+                wait_frame();           /* a ship a frame: seven in one overran it, up to 338,000 cycles */
             }
             break;
         }
@@ -791,12 +933,12 @@ static int fmt_u16(char *p, int v)
     return m;
 }
 
-/* The win or lose picture and its jingle, as on GB. START or A skips it, but only on a fresh press
-   after SPLASH_LOCK: key_hit is an edge, so a button still held from the last shot does nothing. */
+/* The win or lose picture and its jingle. START or A skips both, but only on a fresh press after
+   SPLASH_LOCK: key_hit is an edge, so a button still held from the last shot does nothing. */
 static void splash(int won)
 {
-    const u16 *notes = won ? jingle_win : jingle_lose;
     int f;
+    music_stop();               /* a shot's effect on CH4 rings on */
     obj_hide(&obuf[0]);
     obj_hide(&obuf[1]);
     fade(1);
@@ -804,14 +946,12 @@ static void splash(int won)
     smoke_scan();
     fade(0);
     state = ST_SPLASH;
-    REG_SND1SWEEP = 0;
-    REG_SND1CNT = 0x7380;       /* 50% duty, vol 7, decay */
+    music_play(won ? &tune_win : &tune_lose);
     for (f = 0; f < SPLASH_FRAMES; f++) {
-        if (f < 36 && f % 9 == 0) REG_SND1FREQ = 0x8000 | notes[f / 9];
-        if (f == 36) REG_SND1CNT = 0;
         wait_frame();
         if (f >= SPLASH_LOCK && key_hit(KEY_START | KEY_A)) break;
     }
+    music_stop();               /* a skip: nothing carries on over the end screen */
 }
 
 /* Both fleets revealed. */
@@ -875,9 +1015,11 @@ int main(void)
     irq_init(NULL);
     irq_add(II_VBLANK, on_vbl);
 
+    music_play(&tune_title);
     title_screen();             /* outside the loop: a replay goes straight to the menu */
     for (;;) {
         int manual = menu();
+        music_play(&tune_battle);       /* through placement too, and on until splash */
         /* After the keypress, per game: human timing is the only entropy here, and seeding
            at boot deals the same fleets every power-on (the GB game had this bug). */
         game_seed = frames * 0x9E3779B1u ^ cycles();

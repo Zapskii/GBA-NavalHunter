@@ -2,11 +2,13 @@
 """Drives the real ROM in libmgba (tools/emu.c) with real key presses. What it pins is what
 only the ROM can show. Boards are set up by poke, never by a test build. Screenshots go to
 shots/. Exit 1 on any FAIL."""
-import os, re, subprocess, sys
+import array, os, re, subprocess, sys
 from PIL import Image
 
 DISPCNT, VRAM, OAM, PAL = 0x04000000, 0x06000000, 0x07000000, 0x05000000
 SND4ENV, SND4POLY, SNDSTAT, SND1ENV = 0x04000079, 0x0400007C, 0x04000084, 0x04000063
+SND1CNT, SND2CNT, SND3SEL, SND3CNT, SND4CNT, SND4FREQ = 0x04000062, 0x04000068, 0x04000070, 0x04000072, 0x04000078, 0x0400007C
+SNDDMGCNT, SNDDSCNT = 0x04000080, 0x04000082
 ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END, ST_SPLASH = range(8)
 # The palette (C_*), hull segments (SEG_*) and cell art (T_*), as generated
 globals().update({n: int(v) for n, v in re.findall(r"(\w+) = (\d+)", open("src/art.h").read())})
@@ -25,6 +27,11 @@ SHELL_FRAMES, IMPACT_RATE, AFTER_SHOT = 24, 4, 6
 SHOT_LIMIT = 92             # about 1.5 s, the most a shot may take, the enemy's thinking included
 OBJ_ART = 520               # main.c: where art_obj sits in sprite tiles
 OBJ_ANIM, ANIMS, OBJ_SMOKE_AT, SMOKE_MAX = 2, 8, 10, 36
+HOLD, REST, NOTE_C2, NOTE_REGS, END = 0, 1, 2, 72, 0xFF       # main.c's notes
+TUNE_SIZE = 20
+TUNES = {"tune_title": (16, 6), "tune_battle": (12, 8), "tune_win": (4, 6), "tune_lose": (4, 6)}     # bars, rows a bar
+# Melody and harmony, then bass. A note outside these is a typo, or lost on the speaker. E3=NOTE_C2+16
+VOICE_RANGE = ((NOTE_C2 + 12, NOTE_C2 + 48), (NOTE_C2 + 12, NOTE_C2 + 48), (NOTE_C2, NOTE_C2 + 24))
 TIMING = int(os.environ.get("E2E_TIMING", 0))   # extra frames before the first key, so another run deals other seeds
 
 fails = 0
@@ -453,7 +460,7 @@ def animation_checks():
     e.sea(1)
 
     # --- impact art: a miss splashes, a hit explodes, on either board
-    miss = water(own_o)[0]
+    miss = next(i for i in water(own_o) if i not in around(sub))     # the sunk sub's ring is refused
     e.goto(miss % 10, miss // 10)
     e.run(2, A); e.run(2); f0 = e.u32("frames") - 4
     e.land()
@@ -648,6 +655,315 @@ def whole_games():
     for g, how in ((plain, "plain"), (skipped, "skipping")):
         s = g["samples"]
         print(f"     ADMIRAL {how}: mean samples {sum(s) / len(s):.0f}, first 10 {sum(s[:10]) / 10:.0f}, min {min(s)}, under 50 on {sum(v < 50 for v in s)} of {len(s)} turns; {g['frames']} frames, {g['frames'] / 60:.0f} s")
+
+def tune(e, name):
+    """A tune as the ROM holds it: rate, loop, envelopes, and its three voices up to END."""
+    b = e.peek(e.sym[name], TUNE_SIZE)
+    t = dict(name=name, rate=b[12], loop=b[13], cnt=[int.from_bytes(b[k:k + 2], "little") for k in (14, 16, 18)], voice=[])
+    for k in range(3):
+        a = int.from_bytes(b[k * 4:k * 4 + 4], "little")
+        raw = e.peek(a, 1024)
+        t["voice"].append(list(raw[:raw.index(END)]) if END in raw else list(raw))
+    return t
+
+def note_hz(n): return 65.406 * 2 ** ((n - NOTE_C2) / 12)
+def note_name(n):
+    if n == HOLD: return "_"
+    if n == REST: return "-"
+    k = n - NOTE_C2
+    return ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"][k % 12] + str(k // 12 + 2)
+
+def row_notes(t, r): return sum(t["voice"][v][r] > REST for v in range(3))
+
+def table_checks(e):
+    """Every table: bars add up in every voice, so a loop can't drift, and notes are in their channels' range."""
+    reg = [int.from_bytes(e.peek(e.sym["note_reg"] + k * 2, 2), "little") for k in range(NOTE_REGS)]
+    check(all(0 < v < 2048 for v in reg), "note_reg: every value fits a frequency register")
+    check(all(abs(131072 / (2048 - reg[k]) / note_hz(k + NOTE_C2) - 1) < 0.025 for k in range(NOTE_REGS)), "note_reg: every value is its note, within 2.5%")
+    out = {}
+    for name, (bars, beats) in TUNES.items():
+        t = out[name] = tune(e, name)
+        lens = [len(v) for v in t["voice"]]
+        check(lens == [bars * beats] * 3, f"{name}: all three voices are {bars} bars of {beats}: {lens} rows")
+        check(0 < t["rate"] and t["loop"] == (name in ("tune_title", "tune_battle")), f"{name}: {t['rate']} frames a row, {'loops' if t['loop'] else 'ends'}")
+        for v, (lo, hi) in enumerate(VOICE_RANGE):
+            used = [n for n in t["voice"][v] if n > REST]
+            check(used and all(lo <= n <= hi for n in used), f"{name}: channel {v + 1}'s notes are in its range: {note_name(min(used))} to {note_name(max(used))}" if used else f"{name}: channel {v + 1} plays")
+            check(all(n + (12 if v == 2 else 0) - NOTE_C2 < NOTE_REGS for n in used), f"{name}: channel {v + 1} stays inside note_reg")
+        check(t["voice"][2][0] > REST, f"{name}: the bass starts on a note, not on whatever was held")
+        frames = bars * beats * t["rate"]
+        print(f"     {name}: {frames} frames, {frames / 59.7275:.1f} s; {sum(row_notes(t, r) for r in range(min(lens)))} notes; envelopes {t['cnt'][0]:#06x} {t['cnt'][1]:#06x} CH3 {t['cnt'][2]:#06x}")
+        if not t["loop"]:
+            check(sum(n > REST for n in t["voice"][0]) > 4, f"{name}: longer than the GB's four notes")
+            check(frames < SPLASH_FRAMES, f"{name}: over inside the picture's {SPLASH_FRAMES} frames: {frames}")
+    return out
+
+def channel_regs(e):
+    return [e.reg(SND1CNT) & 0xFFC0, e.reg(SND2CNT) & 0xFFC0, e.reg(SND3CNT) & 0xE000]
+
+def walk(e, t, loops, what, each=None):
+    """Follow a tune a frame at a time from its first row, against the table: the row, each channel's last
+    frequency value (music_last, as those registers can't be read back), envelopes (which can), the note
+    count. Exact for every frame, so the voices can't have moved apart or a loop have grown or shrunk."""
+    n, rate, reg = len(t["voice"][0]), t["rate"], lambda k: int.from_bytes(e.peek(e.sym["note_reg"] + k * 2, 2), "little")
+    want_env = [t["cnt"][0] & 0xFFC0, t["cnt"][1] & 0xFFC0, t["cnt"][2] & 0xE000]
+    # A run stops just after VBlank starts, which can be anywhere in the handler, so the frame a row changes
+    # on can read either way. Rows are compared away from their edges, and the loop's length is timed.
+    if not ((not t["loop"] or e.until(lambda: e.u16("music_row") != 1, rate + 2)) and e.until(lambda: e.u16("music_row") == 1, n * rate + 2)):
+        check(False, f"{what}: reaches its first row"); return
+    f0 = e.u32("frames")
+    e.run(2)
+    notes = e.u32("jingle_notes")
+    last = [int.from_bytes(e.peek(e.sym["music_last"] + 2 * v, 2), "little") for v in range(3)]
+    bad = None
+    for f in range(3, loops * n * rate):
+        e.run()
+        r = f // rate % n
+        if f % rate == 0:
+            for v in range(3):
+                c = t["voice"][v][r]
+                if c == REST: last[v] = 0
+                elif c > REST: last[v] = reg(c - NOTE_C2 + (12 if v == 2 else 0))
+            notes += row_notes(t, r)
+        if not 2 <= f % rate <= rate - 2: continue
+        got = (e.u16("music_row"), e.u32("jingle_notes"), [int.from_bytes(e.peek(e.sym["music_last"] + 2 * v, 2), "little") for v in range(3)])
+        env = channel_regs(e)
+        stat = e.reg(SNDSTAT)
+        if (got != (r + 1, notes, last) or any(last[v] and env[v] != want_env[v] for v in range(3)) or bool(stat & 4) != bool(last[2])
+                or bool(e.reg(SND3SEL) & 0x80) != bool(last[2]) or (each and not each())) and bad is None:
+            bad = (f, r, got, (r + 1, notes, list(last)), env, stat)
+    check(bad is None, f"{what}: {loops} x {n} rows of {rate} frames, every row's note count, frequency values and envelopes are the table's: {bad or 'all ' + str(loops * n)}")
+    if t["loop"]:
+        e.until(lambda: e.u16("music_row") == 1, 3 * rate)
+        took = e.u32("frames") - f0
+        check(abs(took - loops * n * rate) <= 1, f"{what}: {loops} loops take {took} frames, not one row or frame more than {loops * n * rate}")
+
+def mixer(e, n, mask=0xF):
+    """The real mixer's output over n frames with only those channels let through, after 6 frames for the
+    change of mask to settle: the output filter takes a moment. (samples, peak, rms)."""
+    e.poke(SNDDMGCNT, bytes([0x77, mask | mask << 4]))
+    e.run(6)
+    e.cmd("audio")
+    e.run(n)
+    got = e.cmd("audio").split()
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    return int(got[0]), int(got[1]), float(got[2])
+
+def pitches(e, t, v):
+    """Each note of a voice, heard: that channel alone through the mixer, its pitch from the waveform."""
+    n, rate = len(t["voice"][0]), t["rate"]
+    e.until(lambda: e.u16("music_row") == n and e.u16("music_wait") == 1, n * rate + 2)     # the frame before the top
+    e.poke(SNDDMGCNT, bytes([0x77, 0x11 << v]))
+    os.makedirs("shots", exist_ok=True)
+    e.cmd("record shots/.pcm")
+    e.run(n * rate + 1)
+    e.cmd("record -")
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    pcm = array.array("h")
+    pcm.frombytes(open("shots/.pcm", "rb").read())
+    os.remove("shots/.pcm")
+    per_frame = len(pcm) / (n * rate + 1)
+    rate_hz = per_frame * 59.7275
+    out = []
+    for r, c in enumerate(t["voice"][v]):
+        if c <= REST: continue
+        w = pcm[int((1 + r * rate + 1) * per_frame):int((1 + r * rate + rate - 1) * per_frame)]
+        lo, hi = (min(w), max(w)) if w else (0, 0)
+        mid, band = (lo + hi) / 2, (hi - lo) / 8        # about its middle: a 25% duty isn't centred on 0
+        ups, armed = [], False
+        for i, x in enumerate(w):
+            if x < mid - band: armed = True
+            elif x > mid + band and armed: armed = False; ups.append(i)
+        hz = (len(ups) - 1) * rate_hz / (ups[-1] - ups[0]) if len(ups) > 2 else 0
+        out.append((r, c, hz))
+    return out
+
+def music_checks():
+    e = Emu("navalhunter.gba")
+    e.run(10 + TIMING)
+    bad0 = fails
+    tunes = table_checks(e)
+    if fails > bad0:                            # following a broken table by frame would only crash
+        e.p.stdin.close(); e.p.wait()
+        return
+    title, battle, win, lose = (tunes[k] for k in ("tune_title", "tune_battle", "tune_win", "tune_lose"))
+
+    # --- the title
+    check(e.u32("music") == e.sym["tune_title"], "the title tune plays on the title")
+    # before anything here pokes the mixer's enables: what the ROM itself set, heard as it stands
+    e.cmd("audio"); e.run(120)
+    got = e.cmd("audio").split()
+    check(int(got[1]) > 1000, f"it reaches the mixer with the ROM's own settings: peak {got[1]}, rms {got[2]}")
+    check(e.reg(SNDDMGCNT) == 0xFF77 and e.reg(SNDDSCNT) & 3 == 2, f"PSG all channels both sides, master 7, mix 100%: {e.reg(SNDDMGCNT):#06x} {e.reg(SNDDSCNT):#06x}")
+    n0, sim0 = e.u32("jingle_notes"), e.peek(e.sym["sim_state"], 4)
+    e.run(60)
+    check(e.u32("jingle_notes") > n0, f"jingle_notes advances on the title: {n0} to {e.u32('jingle_notes')}")
+    walk(e, title, 2, "the title tune", lambda: not e.reg(SNDSTAT) & 8)     # and CH4 stays off all through
+    check(e.peek(e.sym["sim_state"], 4) == sim0, "the music draws nothing from the generator")
+    for v in range(3):
+        got = pitches(e, title, v)
+        off = [(note_name(c), round(hz)) for r, c, hz in got if abs(hz / note_hz(c) - 1) > 0.03]
+        check(len(got) >= 16 and not off, f"title, channel {v + 1} alone through the mixer: every one of its {len(got)} notes is at the table's pitch, within 3%: {off[:4]}")
+    samples, peak, rms = mixer(e, len(title["voice"][0]) * title["rate"])
+    title_rms, title_peak = rms, peak
+    print(f"     title through the mixer: {samples} samples, peak {peak}, rms {rms:.0f}")
+    check(rms > 1000, f"it is not silent: rms {rms:.0f}")
+    s = [mixer(e, 60, 1 << v) for v in range(3)]
+    check(all(x[1] > 500 for x in s), f"each of CH1, CH2, CH3 sounds: peaks {[x[1] for x in s]}")
+    # the loudest it can be: a full-volume noise effect over the title tune, against the mixer's top
+    peak = 0
+    for _ in range(8):
+        e.poke(SND4CNT, bytes([0x00, 0xF7])); e.poke(SND4FREQ, bytes([0x76, 0x80]))
+        peak = max(peak, mixer(e, 90)[1])
+    print(f"     title plus a full-volume CH4 effect: peak {peak} of 32767")
+    check(peak < 30000, f"all four channels together don't reach the top of the mixer: peak {peak}")
+    e.run(120)
+
+    # --- on to the menu, silent
+    e.run(1, START)
+    e.run(3, START)
+    check(e.u32("music") == e.sym["tune_title"], "the tune carries on into the fade")
+    check(e.wait_state(ST_MENU, 40), "START goes to the menu")
+    check(e.u32("music") == 0, "the music stopped by the menu")
+    n0 = e.u32("jingle_notes")
+    samples, peak, rms = mixer(e, 120)
+    check(e.u32("jingle_notes") == n0, f"jingle_notes stops with it: {n0}")
+    check(e.reg(SNDSTAT) & 7 == 0, f"CH1, CH2, CH3 are off: SNDSTAT {e.reg(SNDSTAT):#06x}")
+    check(samples > 100000 and peak == 0, f"and the mixer is silent on the menu: {samples} samples, peak {peak}")
+
+    # --- placement and battle
+    e.tap(B)
+    check(e.state() == ST_PLACE and e.u32("music") == e.sym["tune_battle"], "placing your fleet: the battle loop starts")
+    e.run(120)
+    check(e.u32("jingle_notes") > n0, "the note counter moves")
+    row = e.u16("music_row")
+    e.tap(START)
+    check(e.battle_ready() and e.u32("music") == e.sym["tune_battle"] and e.u16("music_row") >= row, "and carries on into the battle, not from the top")
+    n0 = e.u32("jingle_notes")
+    e.run(120)
+    check(e.u32("jingle_notes") > n0, f"jingle_notes advances in battle: {n0} to {e.u32('jingle_notes')}")
+    walk(e, battle, 2, "the battle loop")
+    check(mixer(e, len(battle["voice"][0]) * battle["rate"], 8)[1] == 0, "and nothing sounds on CH4 through a whole loop of it")
+    samples, peak, rms = mixer(e, len(battle["voice"][0]) * battle["rate"])
+    print(f"     battle loop through the mixer: peak {peak}, rms {rms:.0f}")
+    check(rms > 50, f"it is not silent: rms {rms:.0f}")
+    check(rms < title_rms / 2 and peak < title_peak, f"and is well under the title tune: rms {rms:.0f} v {title_rms:.0f}, peak {peak} v {title_peak}")
+    s = [mixer(e, len(battle["voice"][0]) * battle["rate"], 1 << v) for v in range(3)]
+    check(all(x[1] > 100 for x in s), f"each of CH1, CH2, CH3 sounds in it: peaks {[x[1] for x in s]}")
+    frames_on = sum(any(battle["voice"][v][r] > REST for v in range(2)) for r in range(len(battle["voice"][0])))
+    print(f"     battle loop: a melody or harmony note on {frames_on} of its {len(battle['voice'][0])} rows")
+
+    # --- effects on CH4, heard over the music
+    own_o = e.board("ob")[0]
+    env = [t & 0xFFC0 for t in battle["cnt"][:2]]
+    for cell, a, b, what in ((water(own_o)[0], 0x21, 0x71, "miss"), (cells(own_o, 0)[0], 0xF3, 0x65, "hit"), (cells(own_o, 5)[0], 0xF7, 0x76, "sinking")):
+        e.battle_ready()
+        e.goto(cell % 10, cell // 10)
+        n0 = e.u32("jingle_notes")
+        e.poke(SNDDMGCNT, bytes([0x77, 0x88]))
+        e.run(2, A); e.run(2); e.cmd("audio")
+        e.run(8)
+        before = e.cmd("audio").split()
+        e.land()
+        got = e.peek(SND4CNT + 1)[0], e.peek(SND4FREQ)[0]
+        e.run(6)
+        after = e.cmd("audio").split()
+        e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+        check(got == (a, b), f"{what}: its whole setup is on CH4, over the music: {got[0]:#x} {got[1]:#x}")
+        check(before[1] == "0" and int(after[1]) > 150, f"{what}: heard when the shell lands, CH4 alone through the mixer: peak {before[1]} in flight, {after[1]} on landing")
+        check(e.u32("music") == e.sym["tune_battle"], f"{what}: and the music plays on")
+        e.battle_ready()
+        e.run(200)                              # a bar and more: the loop is sparse
+        check(e.u32("jingle_notes") > n0, f"{what}: its notes still counting: {n0} to {e.u32('jingle_notes')}")
+        check(channel_regs(e)[:2] == env, f"{what}: with CH1 and CH2's setup untouched")
+
+    # --- your last shot, skipped: the loop stops, the effect rings on
+    last = last_one_alive(e, "ob", False)
+    e.run(4)
+    e.goto(last % 10, last // 10)
+    e.run(2, A); e.run(2)
+    e.run(1, B); e.run(1)
+    check(e.until(lambda: e.u32("music") == 0, 20), "the last ship sunk stops the loop")
+    check(e.reg(SNDSTAT) & 7 == 0, f"CH1, CH2, CH3 go off at once: SNDSTAT {e.reg(SNDSTAT):#06x}")
+    check(e.reg(SNDSTAT) & 8 and e.peek(SND4CNT + 1)[0] == 0xF7, "and the sinking's CH4 effect is not cut")
+    check(mixer(e, 5, 7)[1] == 0, "the mixer agrees: CH1-CH3 silent")      # the jingle is under 20 frames off
+    e.poke(SNDDMGCNT, bytes([0x77, 0x88]))
+    e.run(2); e.cmd("audio"); e.run(2)
+    got = e.cmd("audio").split()
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    check(int(got[1]) > 500 and e.u32("music") == 0, f"and CH4 sounding, before the jingle: peak {got[1]}")
+
+    # --- the win jingle, over the picture
+    check(e.wait_state(ST_SPLASH, 60), "the win picture")
+    check(e.until(lambda: e.u32("music") == e.sym["tune_win"], 2), "the win jingle starts on it")
+    n0, f0 = e.u32("jingle_notes"), e.u32("frames")
+    e.poke(SNDDMGCNT, bytes([0x77, 0x77]))
+    e.cmd("audio")
+    walk(e, win, 1, "the win jingle")
+    e.run(2)
+    got = e.cmd("audio").split()
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    check(int(got[1]) > 1000, f"it sounds through the mixer: peak {got[1]}, rms {got[2]}")
+    check(e.u32("music") == 0 and e.state() == ST_SPLASH, f"it ends, without looping, before the picture does ({e.u32('frames') - f0} frames in)")
+    check(e.u32("jingle_notes") == n0 + sum(row_notes(win, r) for r in range(len(win["voice"][0]))), f"having played every note: {e.u32('jingle_notes') - n0}")
+    check(e.reg(SNDSTAT) & 7 == 0, f"nothing rings on: SNDSTAT {e.reg(SNDSTAT):#06x}")
+    check(mixer(e, 30, 7)[1] == 0, "and the mixer is silent on CH1-CH3 for the rest of the picture")
+    n0 = e.u32("jingle_notes")
+    check(e.wait_state(ST_END, SPLASH_FRAMES + 60), "the end screen comes")
+    e.run(120)
+    check(e.u32("jingle_notes") == n0 and e.u32("music") == 0, "silent, with no note started")
+    e.run(120)
+    check(mixer(e, 60)[1] == 0, "the mixer is silent on the end screen")
+
+    # --- replay: battle music again without the title
+    e.tap(START)
+    check(e.wait_state(ST_MENU, 40), "START replays")
+    check(e.u32("music") == 0 and mixer(e, 30)[1] == 0, "silent on the menu again")
+    e.tap(A)
+    check(e.battle_ready() and e.u32("music") == e.sym["tune_battle"], "and the battle loop starts again")
+    check(e.u32("jingle_notes") > n0, "from the top, counting")
+
+    # --- losing, and skipping the picture with the bass note sustained
+    own_o = e.board("ob")[0]
+    last_one_alive(e, "pb", True)
+    e.run(4)
+    i = water(own_o)[0]
+    e.goto(i % 10, i // 10)
+    e.tap(A)
+    check(e.wait_state(ST_SPLASH, 300), "the lose picture")
+    check(e.until(lambda: e.u32("music") == e.sym["tune_lose"], 2), "the lose jingle starts on it")
+    e.run(SPLASH_LOCK + 10)
+    check(e.reg(SNDSTAT) & 4 and e.u32("music") == e.sym["tune_lose"], "still playing, a bass note sustained, past the lock")
+    n0 = e.u32("jingle_notes")
+    e.run(2, START)
+    check(e.u32("music") == 0 and e.reg(SNDSTAT) & 7 == 0, f"a skip stops the jingle at once, bass and all: SNDSTAT {e.reg(SNDSTAT):#06x}")
+    check(mixer(e, 10, 7)[1] == 0, "and the mixer agrees")
+    check(e.wait_state(ST_END, 60), "the end screen")
+    e.run(60)
+    check(e.u32("jingle_notes") == n0 and mixer(e, 30)[1] == 0, "no note droning or left over on it")
+    e.tap(START)
+    check(e.wait_state(ST_MENU, 40) and e.u32("music") == 0, "START replays, clean")
+    e.tap(A)
+    check(e.battle_ready() and e.u32("music") == e.sym["tune_battle"] and mixer(e, 200)[1] > 100, "and the loop sounds again")
+    check(e.u32("frame_drops") == 0, f"no frame dropped through all the music ({e.u32('frame_drops')})")
+    cost = e.u32("music_cycles")
+    print(f"     music_step's worst, in the VBlank handler: {cost} cycles, of a frame's {FRAME_CYCLES}")
+    check(cost < 1500, f"the note player costs next to nothing: {cost} cycles")
+    e.p.stdin.close(); e.p.wait()
+
+def instant_randomise():
+    """START the moment placement opens: all seven ships dealt at once, with the screen to clear after."""
+    worst = drops = 0
+    for wait in range(8):
+        e = Emu("navalhunter.gba")
+        e.run(10); e.tap(START); e.wait_state(ST_MENU, 40); e.run(5 + wait)
+        e.tap(B)
+        e.poke(e.sym["worst_frame"], bytes(4))
+        e.tap(START)
+        e.battle_ready()
+        worst, drops = max(worst, e.u32("worst_frame")), drops + e.u32("frame_drops")
+        e.p.stdin.close(); e.p.wait()
+    check(drops == 0 and worst < FRAME_CYCLES, f"START at once on placement, 8 deals: no frame dropped ({drops}), worst {worst} of {FRAME_CYCLES}")
 
 def main():
     e = Emu("navalhunter.gba")
@@ -959,7 +1275,7 @@ def main():
     e.sea(1)
     e.run(1, A)
     check(e.until(lambda: e.reg(SNDSTAT) & 1, 10, A), "the win jingle sounds on the square channel")
-    check(e.peek(SND1ENV)[0] == 0x73, "with the GB's envelope")
+    check(e.peek(SND1ENV)[0] == e.peek(e.sym["tune_win"] + 15)[0], f"with the jingle's envelope: {e.peek(SND1ENV)[0]:#x}")
     check(e.fb() == e.art("art_win", 38400), "the screen is the win art, pixel for pixel")
     check(e.pal(ART_PAL_FIRST, ART_PAL_N) == e.art("art_win_pal", ART_PAL_N * 2), "in its palette")
     shared_range_kept(e, "win picture")
@@ -1273,6 +1589,8 @@ def main():
     check(fleets[0] != fleets[1], "power-ons with different key timing deal different fleets")
     check(fleets[0][:100] != fleets[0][100:], "and the two fleets of one game differ")
 
+    music_checks()
+    instant_randomise()
     animation_checks()
     whole_games()
 

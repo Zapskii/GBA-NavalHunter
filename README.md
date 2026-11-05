@@ -17,7 +17,9 @@ a preview in `tools/art.png`).
   damaged ships smoke. A or B skips an animation; a skip never fires a shot and a button held down skips nothing. A
   skip changes nothing in the game: the rules resolve before the shell leaves. ADMIRAL samples against the clock, so its
   own shots can differ from one run to the next if the timing does.
-- Game over: the win or lose picture for 5 seconds (START or A skips it), then both fleets. START plays again.
+- Game over: the win or lose picture and its jingle for 5 seconds (START or A skips both), then both fleets. START plays again.
+- Music is on the PSG: a tune on the title, a quiet loop while you place and fight, silent on the menu and end screen. Effects
+  stay on the noise channel, so music and effects never fight over one.
 
 Build with Docker (`devkitpro/devkitarm`): `make`. `make run` opens mGBA, `make test` checks the rules on the
 host, `make e2e` drives the real ROM headlessly. Not yet tested on real hardware.
