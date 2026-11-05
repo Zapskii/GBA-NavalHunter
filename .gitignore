@@ -1,3 +1,11 @@
+*.elf
+*.gba
+*.sym
+*.sav
+*.o
+emu
+test_sim
+shots/
 .DS_Store
 .claude/
 PLAN.md
