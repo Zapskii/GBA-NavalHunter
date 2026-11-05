@@ -12,9 +12,58 @@
 #include <stdlib.h>
 #include <string.h>
 #include "sim.h"
+#include "gfx.c"        /* tonc-free on purpose, so its rules are tested here against the same code */
 
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } } while (0)
+
+/* gfx_segment: all five lengths both ways round, and gfx_seg_of must agree with it cell for cell. */
+static void segment_checks(void) {
+    Board b;
+    int len, h, k;
+    for (len = 1; len <= 5; len++)
+        for (h = 0; h <= 1; h++) {
+            clear_board(&b);
+            place_ship(&b, 2, 3, (uint8_t)len, (uint8_t)h, 0);
+            for (k = 0; k < len; k++) {
+                int i = h ? 3 * 10 + 2 + k : (3 + k) * 10 + 2;
+                int want = len == 1 ? SEG_BOAT
+                         : h ? (k == 0 ? SEG_H_STERN : k == len - 1 ? SEG_H_BOW : SEG_H_MID)
+                             : (k == 0 ? SEG_V_BOW : k == len - 1 ? SEG_V_STERN : SEG_V_MID);
+                CHECK(gfx_segment(b.own, i) == want, "segment from neighbours");
+                CHECK(gfx_seg_of(k, len, h) == want, "segment of a preview");
+            }
+        }
+    /* other ids beside it are not neighbours, at the board's edges too */
+    clear_board(&b);
+    place_ship(&b, 0, 0, 2, 1, 0);
+    place_ship(&b, 2, 0, 2, 1, 1);
+    place_ship(&b, 0, 1, 2, 1, 2);
+    CHECK(gfx_segment(b.own, 1) == SEG_H_BOW, "a different id ahead does not extend a hull");
+    CHECK(gfx_segment(b.own, 2) == SEG_H_STERN, "nor one behind");
+    clear_board(&b);
+    place_ship(&b, 9, 0, 1, 1, 0);
+    place_ship(&b, 0, 1, 1, 1, 0);      /* the next index, but not the next cell: another row */
+    CHECK(gfx_segment(b.own, 9) == SEG_BOAT && gfx_segment(b.own, 10) == SEG_BOAT, "a row's end does not wrap");
+}
+
+/* gfx_blit at odd and even x, wide and narrow: every pixel lands, and nothing around it changes. */
+static void blit_checks(void) {
+    static uint16_t fb[GFX_W * GFX_H / 2];
+    static const uint8_t src[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    int x, w, px, py;
+    gfx_fb = fb;
+    for (x = 4; x <= 5; x++)
+        for (w = 1; w <= 4; w++) {
+            memset(fb, 0xEE, sizeof fb);
+            gfx_blit(x, 2, w, 2, src, 6);
+            for (py = 0; py < 6; py++)
+                for (px = 0; px < 12; px++) {
+                    int got = fb[py * GFX_W / 2 + px / 2] >> (px & 1 ? 8 : 0) & 0xFF, in = px >= x && px < x + w && (py == 2 || py == 3);
+                    CHECK(got == (in ? src[(py - 2) * 6 + px - x] : 0xEE), "gfx_blit pixel");
+                }
+        }
+}
 
 /* Play one full solo game with the AI at `level` against a random fleet. Returns the
    number of shots. Enforces the honest queue's invariant: while any ship is partly hit,
@@ -502,6 +551,9 @@ int main(int argc, char **argv) {
     uint8_t i, t;
     uint32_t seed = argc > 1 ? (uint32_t)strtoul(argv[1], 0, 0) : 8;    /* a seed to sweep the checks with */
     sim_seed(seed);
+
+    segment_checks();
+    blit_checks();
 
     /* ---- place_ship geometry ---- */
     clear_board(&b);

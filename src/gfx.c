@@ -4,6 +4,7 @@
  * so every pixel is a read, merge, write of 16 bits. gfx_fb is volatile so the compiler
  * can't turn a fill loop into a memset, which would write bytes. */
 #include "gfx.h"
+#include "art.h"
 
 volatile uint16_t *gfx_fb;
 
@@ -102,4 +103,37 @@ void gfx_text(int x, int y, const char *s, uint8_t c)
             for (b = 0; b < 5; b++)
                 if (font[*s - ' '][r] & 16 >> b) put(x + b, y + r, c);
     }
+}
+
+void gfx_blit(int x, int y, int w, int h, const uint8_t *src, int stride)
+{
+    for (; h > 0; h--, y++, src += stride) {
+        int i = 0;
+        volatile uint16_t *p;
+        if (x & 1) put(x, y, src[i++]);
+        p = gfx_fb + y * GFX_W / 2 + (x + i) / 2;
+        for (; i + 1 < w; i += 2) *p++ = src[i] | src[i + 1] << 8;
+        if (i < w) put(x + i, y, src[i]);
+    }
+}
+
+static int seg_from(int before, int after, int horiz)
+{
+    /* before and after run left to right, or top to bottom */
+    if (!before && !after) return SEG_BOAT;
+    if (horiz) return !before ? SEG_H_STERN : !after ? SEG_H_BOW : SEG_H_MID;
+    return !before ? SEG_V_BOW : !after ? SEG_V_STERN : SEG_V_MID;
+}
+
+int gfx_segment(const uint8_t *own, int i)
+{
+    int id = own[i], x = i % 10, y = i / 10;
+    int l = x > 0 && own[i - 1] == id, r = x < 9 && own[i + 1] == id;
+    if (l || r) return seg_from(l, r, 1);
+    return seg_from(y > 0 && own[i - 10] == id, y < 9 && own[i + 10] == id, 0);
+}
+
+int gfx_seg_of(int k, int len, int horiz)
+{
+    return seg_from(k > 0, k < len - 1, horiz);
 }

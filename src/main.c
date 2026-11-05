@@ -1,5 +1,5 @@
-/* Naval Hunter for the GBA: the GB game's flow and rules with both boards on screen, in
- * placeholder art. Mode 4, one page. The enemy board is big, yours is small, and a board
+/* Naval Hunter for the GBA: the GB game's flow and rules with both boards on screen. Mode 4, one
+ * page. tools/gen_art.py draws the art and its top comment gives the palette plan. The enemy board is big, yours is small, and a board
  * only ever redraws the cells whose look changed (sync_boards).
  *
  *   y 3    status (left), YOUR WATERS (right)
@@ -12,13 +12,13 @@
  */
 #include <tonc.h>
 #include <string.h>
+#include "art.h"
 #include "gfx.h"
 #include "sim.h"
 
-enum { ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END };
-enum { C_BG, C_INK, C_GRID, C_SEA, C_SHIP, C_BAD, C_RED, C_DKRED, C_YEL, C_DIM, C_KNOWN };
+enum { ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END, ST_SPLASH };
 enum { VIEW_HIDDEN, VIEW_SHIPS, VIEW_END };     /* what a board shows of its fleet */
-enum { L_WATER, L_MISS, L_HIT, L_SUNK, L_SHIP, L_BAD, L_KNOWN, L_UNDRAWN = 0xFF };
+#define UNDRAWN 0xFF            /* in shown[]: no art from art.h's T_* */
 
 #define BIG_X 12
 #define BIG_Y 22
@@ -26,6 +26,10 @@ enum { L_WATER, L_MISS, L_HIT, L_SUNK, L_SHIP, L_BAD, L_KNOWN, L_UNDRAWN = 0xFF 
 #define SMALL_Y 12
 #define PANEL_X 144
 #define PANEL_Y 103
+#define ICON_X (PANEL_X + 63)   /* odd, so tools/e2e.py pins gfx_blit's odd-x path on a real pixel */
+#define START_Y 133             /* the PRESS START on the title */
+#define SPLASH_FRAMES 300       /* the win or lose art's hold, as on GB: 5 seconds */
+#define SPLASH_LOCK 36          /* no skipping until the jingle is over, so mashing the last shot's A cannot */
 #define THINK_FRAMES 30         /* the enemy's pause; the AI runs inside it */
 #define ADMIRAL 3
 /* ADMIRAL samples until this scanline, which leaves the frame's own work 80 lines: the idle board
@@ -43,7 +47,7 @@ typedef struct {
     int x, y, size;
     const Board *b;             /* NULL: not on screen */
     u8 view;
-    u8 shown[100];              /* each cell's look as last drawn */
+    u8 shown[100];              /* each cell's art (T_*) as last drawn */
     /* is_known_water per cell, kept because 200 of its 3x3 scans cost 70% of a frame. It can
        only grow when a ship sinks, and look() checks a fired cell first. */
     u8 moat[100];
@@ -78,25 +82,22 @@ static u32 frame_start;
 /* ---------------------------------------------------------------- the boards */
 static u8 look(const Pane *p, int i)
 {
-    int st = p->b->st[i];
-    if (st == S_SUNK) return L_SUNK;
-    if (st == S_HIT) return L_HIT;
-    if (st == S_MISS && p->view != VIEW_END) return L_MISS;     /* the end screen hides misses, as on GB */
-    if (p->view != VIEW_HIDDEN && p->b->own[i] != CELL_EMPTY) return L_SHIP;
-    if (p->view != VIEW_END && p->moat[i]) return L_KNOWN;
-    return L_WATER;
+    const Board *b = p->b;
+    int st = b->st[i];
+    if (st == S_SUNK) return T_SUNK + gfx_segment(b->own, i);
+    /* A hit you cannot see the ship of is a mark on water: a hull here would give its axis away. */
+    if (st == S_HIT) return p->view == VIEW_HIDDEN ? T_HIT : T_HULLHIT + gfx_segment(b->own, i);
+    if (st == S_MISS && p->view != VIEW_END) return T_MISS;     /* the end screen hides misses, as on GB */
+    if (p->view != VIEW_HIDDEN && b->own[i] != CELL_EMPTY) return T_HULL + gfx_segment(b->own, i);
+    if (p->view != VIEW_END && p->moat[i]) return T_KNOWN;
+    return T_WATER;
 }
 
-static void draw_cell(const Pane *p, int i, int l)
+/* A tile holds its cell's top and left grid lines, so a hull can run over them. */
+static void draw_cell(const Pane *p, int i, int t)
 {
-    static const u8 bg[] = { C_SEA, C_SEA, C_RED, C_DKRED, C_SHIP, C_BAD, C_KNOWN };
-    int n = p->size - 1, x = p->x + i % 10 * p->size + 1, y = p->y + i / 10 * p->size + 1;
-    int w = l == L_MISS ? 3 : 5;
-    gfx_rect(x, y, n, n, bg[l]);
-    /* On the big board the 3px mark runs odd x to odd x and the 5px one even to even, so
-       tools/e2e.py can pin a pixel written after its halfword neighbour, both ways round. */
-    if (l == L_MISS || l == L_HIT || l == L_SUNK)
-        gfx_rect(x + (n - w) / 2, y + (n - w) / 2, w, w, l == L_MISS ? C_INK : l == L_HIT ? C_YEL : C_RED);
+    gfx_blit(p->x + i % 10 * p->size, p->y + i / 10 * p->size, p->size, p->size,
+             p->size == 12 ? art_big[t] : art_mini[t], p->size);
     cells_drawn++;
 }
 
@@ -115,7 +116,7 @@ static void sync_pane(Pane *p)
             int dx = i % 10 - place_x, dy = i / 10 - place_y;
             if (place_horiz ? dy == 0 && dx >= 0 && dx < preview_len
                             : dx == 0 && dy >= 0 && dy < preview_len)
-                want = preview_legal ? L_SHIP : L_BAD;
+                want = (preview_legal ? T_HULL : T_BAD) + gfx_seg_of(place_horiz ? dx : dy, preview_len, place_horiz);
         }
         if (want == p->shown[i]) continue;
         /* A whole board does not fit in a frame. Stop near the end of this one and carry on
@@ -194,7 +195,31 @@ static void clear_screen(void)
 {
     big.b = mini.b = NULL;
     status_text[0] = msg_text[0] = 0;
-    memset32((void *)gfx_fb, 0, GFX_W * GFX_H / 4);
+    memset32((void *)gfx_fb, C_BG * 0x01010101u, GFX_W * GFX_H / 4);
+}
+
+/* Eight steps of brightness, written at the top of VBlank so a frame is all one level. Nothing is
+   on screen at full black, so whatever the screen shows next can be loaded under it. */
+static void fade(int out)
+{
+    int k;
+    REG_BLDCNT = BLD_TOP_MASK | BLD_BLACK;
+    for (k = 1; k <= 8; k++) {
+        wait_frame();
+        REG_BLDY = out ? 2 * k : 16 - 2 * k;
+    }
+    wait_frame();
+    if (!out) REG_BLDCNT = BLD_TOP_MASK | BLD_WHITE;    /* flash_hit's setting */
+}
+
+/* A full screen: its palette above the shared range, and its picture. Keep it under black or
+   before the display is on: the old picture must not be shown in the new colours. Indexes 0-63
+   are never touched, so a screen on the shared palette needs nothing put back afterwards. */
+static void art_load(const u16 *pal, const u8 *pix)
+{
+    big.b = mini.b = NULL;
+    memcpy16(pal_bg_mem + ART_PAL_FIRST, pal, ART_PAL_N);
+    memcpy32((void *)gfx_fb, pix, GFX_W * GFX_H / 4);
 }
 
 /* The grid, and every cell owed a draw once the caller sets p->b. */
@@ -207,7 +232,7 @@ static void pane_grid(Pane *p, int view)
     }
     p->view = view;
     p->moat_alive = 0xFF;
-    memset(p->shown, L_UNDRAWN, sizeof p->shown);
+    memset(p->shown, UNDRAWN, sizeof p->shown);
 }
 
 static void big_labels(void)
@@ -226,12 +251,12 @@ static void big_labels(void)
    board yet is blank, so during placement the list is progress, not a promise. */
 static void panel_line(const Board *b, int s)
 {
-    int y = PANEL_Y + 8 * s, sunk = b->hits[s] >= ship_len[s], c = sunk ? C_RED : C_INK, k;
+    int y = PANEL_Y + 8 * s, sunk = b->hits[s] >= ship_len[s], c = sunk ? C_RED : C_INK;
     gfx_rect(PANEL_X, y, 92, 7, C_BG);
     if (!ship_is_placed(b, s)) return;
     gfx_text(PANEL_X, y, ship_name[s], c);
-    for (k = 0; k < ship_len[s]; k++) gfx_rect(PANEL_X + 64 + 5 * k, y + 1, 4, 5, c);
-    if (sunk) gfx_rect(PANEL_X, y + 3, 89, 1, c);
+    gfx_blit(ICON_X, y, ICON_W, ICON_H, art_icon[ship_len[s] - 1][sunk], ICON_W);
+    if (sunk) gfx_rect(PANEL_X, y + 3, 6 * (int)strlen(ship_name[s]) - 1, 1, c);
 }
 
 /* ---------------------------------------------------------------- sound */
@@ -259,18 +284,6 @@ static void sound_tick(void)
 static const u16 jingle_win[4] = { 1797, 1849, 1881, 1922 };    /* C5 E5 G5 C6 */
 static const u16 jingle_lose[4] = { 1797, 1713, 1650, 1546 };   /* C5 G4 E4 C4 */
 
-static void jingle(const u16 *notes)
-{
-    int i;
-    REG_SND1SWEEP = 0;
-    REG_SND1CNT = 0x7380;       /* 50% duty, vol 7, decay */
-    for (i = 0; i < 4; i++) {
-        REG_SND1FREQ = 0x8000 | notes[i];
-        pause_frames(9);
-    }
-    REG_SND1CNT = 0;
-}
-
 static void flash_hit(void)
 {
     REG_BLDY = 8;
@@ -293,13 +306,16 @@ static int repeat_dir(void)
 /* ---------------------------------------------------------------- screens */
 static void title_screen(void)
 {
-    int f = 0;
+    int f = 0, x = (GFX_W - 6 * 11) / 2;
     state = ST_TITLE;
-    text_mid(40, "NAVAL HUNTER", C_INK);
     for (;;) {
         /* Only START leaves. Everything else is ignored, so mashing cannot start a game. */
-        if (f % 120 == 0) text_mid(100, "PRESS START", C_YEL);
-        if (f % 120 == 60) gfx_rect(0, 100, GFX_W, 7, C_BG);
+        if (f % 120 == 0) {
+            gfx_text(x + 1, START_Y + 1, "PRESS START", C_SHADOW);
+            gfx_text(x, START_Y, "PRESS START", C_YEL);
+        }
+        if (f % 120 == 60)      /* the picture back from under the words */
+            gfx_blit(x, START_Y, 66, 8, art_title + START_Y * GFX_W + x, GFX_W);
         wait_frame();
         if (key_hit(KEY_START)) return;
         f++;
@@ -313,16 +329,19 @@ static void menu_level(void)
     text_mid(120, strcat(b, level_name[ai_level]), C_YEL);
 }
 
-/* Returns 1 for manual placement. Key edges, so a held button cannot skip this screen. */
+/* Returns 1 for manual placement. Key edges, so a held button cannot skip this screen. state says
+   ST_MENU only once the keys are live, after the fade. */
 static int menu(void)
 {
-    state = ST_MENU;
+    fade(1);
     clear_screen();
     wait_frame();
     text_mid(40, "NAVAL HUNTER", C_INK);
     text_mid(70, "PLACE YOUR FLEET?", C_INK);
     text_mid(90, "A RANDOM   B MANUAL", C_INK);
     menu_level();
+    fade(0);
+    state = ST_MENU;
     for (;;) {
         wait_frame();
         if (key_hit(KEY_A)) return 0;
@@ -479,34 +498,37 @@ static void enemy_turn(void)
     shot_result(r, sunk, "YOUR ", "ENEMY MISS", "ENEMY HIT!");
 }
 
-/* One game's shooting. Returns 1 if you won. */
-static int battle(void)
+/* Both boards and the fleet list. A piece a frame, and then the boards paint in. */
+static void battle_chrome(int big_view, int mini_view)
 {
-    state = ST_BATTLE;
+    int s;
     clear_screen();
     wait_frame();
-    cx = cy = 0;
-    held_btn = held_timer = 0;
-    shots_fired = shots_hit = 0;
-    last_enemy = 0xFF;
-    /* The chrome takes several frames, a piece a frame, and then the boards paint in. */
-    pane_grid(&big, VIEW_HIDDEN);
+    pane_grid(&big, big_view);
     wait_frame();
-    pane_grid(&mini, VIEW_SHIPS);
+    pane_grid(&mini, mini_view);
     wait_frame();
     big_labels();
     wait_frame();
-    {
-        int s;
-        for (s = 0; s < NSHIP; s++) {
-            panel_line(&ob, s);
-            wait_frame();
-        }
+    for (s = 0; s < NSHIP; s++) {
+        panel_line(&ob, s);
+        wait_frame();
     }
     big.b = &ob;
     mini.b = &pb;
     gfx_text(SMALL_X, 3, "YOUR WATERS", C_DIM);
     gfx_text(PANEL_X, PANEL_Y - 8, "ENEMY FLEET", C_DIM);
+}
+
+/* One game's shooting. Returns 1 if you won. */
+static int battle(void)
+{
+    state = ST_BATTLE;
+    cx = cy = 0;
+    held_btn = held_timer = 0;
+    shots_fired = shots_hit = 0;
+    last_enemy = 0xFF;
+    battle_chrome(VIEW_HIDDEN, VIEW_SHIPS);
     hint("D-PAD AIM   A FIRE");
     status("YOUR TURN");
     cursor_show();
@@ -558,16 +580,36 @@ static int fmt_u16(char *p, int v)
     return m;
 }
 
-/* Both fleets revealed in place, so only the cells that change get redrawn. */
+/* The win or lose picture and its jingle, as on GB. START or A skips it, but only on a fresh press
+   after SPLASH_LOCK: key_hit is an edge, so a button still held from the last shot does nothing. */
+static void splash(int won)
+{
+    const u16 *notes = won ? jingle_win : jingle_lose;
+    int f;
+    obj_hide(&obuf[0]);
+    obj_hide(&obuf[1]);
+    fade(1);
+    art_load(won ? art_win_pal : art_lose_pal, won ? art_win : art_lose);
+    fade(0);
+    state = ST_SPLASH;
+    REG_SND1SWEEP = 0;
+    REG_SND1CNT = 0x7380;       /* 50% duty, vol 7, decay */
+    for (f = 0; f < SPLASH_FRAMES; f++) {
+        if (f < 36 && f % 9 == 0) REG_SND1FREQ = 0x8000 | notes[f / 9];
+        if (f == 36) REG_SND1CNT = 0;
+        wait_frame();
+        if (f >= SPLASH_LOCK && key_hit(KEY_START | KEY_A)) break;
+    }
+}
+
+/* Both fleets revealed. */
 static void end_screen(int won)
 {
     char b[24];
     int n;
-    jingle(won ? jingle_win : jingle_lose);
-    state = ST_END;
-    obj_hide(&obuf[0]);
-    obj_hide(&obuf[1]);
-    big.view = mini.view = VIEW_END;
+    splash(won);
+    fade(1);
+    battle_chrome(VIEW_END, VIEW_END);
     status(won ? "YOU WIN!" : "YOU LOSE");
     n = fmt_u16(b, shots_fired);
     strcpy(b + n, " SHOTS ");
@@ -576,6 +618,9 @@ static void end_screen(int won)
     strcpy(b + n, "%");
     msg(b);
     hint("START NEW GAME");
+    pause_frames(6);            /* the boards paint in under black: 200 cells, under three frames */
+    fade(0);
+    state = ST_END;
     do wait_frame(); while (!key_hit(KEY_START));
 }
 
@@ -595,17 +640,7 @@ int main(void)
     REG_WAITCNT = WS_STANDARD;
     oam_init(oam_mem, 128);
     oam_init(obuf, 2);
-    pal_bg_mem[C_BG] = RGB15(1, 3, 7);
-    pal_bg_mem[C_INK] = RGB15(31, 31, 31);
-    pal_bg_mem[C_GRID] = RGB15(6, 12, 20);
-    pal_bg_mem[C_SEA] = RGB15(3, 8, 16);
-    pal_bg_mem[C_SHIP] = RGB15(20, 22, 24);
-    pal_bg_mem[C_BAD] = RGB15(31, 12, 0);
-    pal_bg_mem[C_RED] = RGB15(29, 4, 4);
-    pal_bg_mem[C_DKRED] = RGB15(10, 1, 2);
-    pal_bg_mem[C_YEL] = RGB15(31, 31, 4);
-    pal_bg_mem[C_DIM] = RGB15(16, 20, 24);
-    pal_bg_mem[C_KNOWN] = RGB15(10, 18, 26);
+    memcpy16(pal_bg_mem, art_shared_pal, ART_PAL_FIRST);
     pal_obj_mem[1] = RGB15(31, 31, 4);
     pal_obj_mem[2] = RGB15(31, 31, 31);
     /* Mode 4 keeps sprite tiles from index 512: lower ones are hidden by the bitmap. */
@@ -619,7 +654,7 @@ int main(void)
     REG_BLDCNT = BLD_TOP_MASK | BLD_WHITE;      /* every layer and the backdrop towards white */
     sound_init();
     gfx_fb = (volatile u16 *)MEM_VRAM;
-    clear_screen();
+    art_load(art_title_pal, art_title);
     REG_DISPCNT = DCNT_MODE4 | DCNT_BG2 | DCNT_OBJ | DCNT_OBJ_1D;
     irq_init(NULL);
     irq_add(II_VBLANK, on_vbl);
