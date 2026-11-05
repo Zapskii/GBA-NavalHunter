@@ -49,7 +49,7 @@ typedef struct {
 } Board;
 
 /* 1 if a ship of `len` fits at (x,y) horizontally (horiz!=0) or vertically,
-   WITHOUT touching any existing ship -- classic Battleship needs a 1-cell moat,
+   WITHOUT touching any existing ship -- the rules need a 1-cell moat,
    implemented by scanning the 3x3 neighbourhood of every hull cell.
    Returns 0 if the hull would run off the board. */
 static uint8_t can_place(const Board *b, uint8_t x, uint8_t y, uint8_t len, uint8_t horiz) {
@@ -142,9 +142,11 @@ static uint8_t fire(Board *b, uint8_t x, uint8_t y, uint8_t *sunk) {
    other cell remains. The random start kills the old every-other-slot parity
    rhythm; the moat rule replaces the accuracy it bought.
  * HARD HUNT: a probability map replaces the random hunt -- see ai_prob_pick.
- * TARGET: after a hit, try the four neighbours; once a second hit of the same
-   ship is adjacent, the orientation is known and we extend the ship's line in
-   both directions, the way a human finishes off a damaged ship.
+ * TARGET: after a hit, try the four neighbours; once a second hit is adjacent,
+   the orientation is known and we extend the line in both directions, the way
+   a human finishes off a damaged ship. Like a human it cannot see where the
+   hull ends, so it finds out by firing past the end. All of this reads st[]
+   only; the one thing it reads from hits[] is whether a ship is sunk.
  * target[] queues the cells to fire before hunting resumes; sinking the ship
    clears it, because every neighbour of a sunk ship is provably water.
  * ai_next() is only a hunt with an EMPTY queue, which means no ship is
@@ -158,58 +160,74 @@ static void ai_clear_queue(void) {
     for (i = 0; i < 100; i++) target[i] = 0;
 }
 
+/* 1 if (x,y) or any of its 8 neighbours has reached firing state `st`. */
+static uint8_t ai_near(const Board *b, uint8_t x, uint8_t y, uint8_t st) {
+    int8_t dx, dy;
+    for (dy = -1; dy <= 1; dy++)
+        for (dx = -1; dx <= 1; dx++) {
+            int8_t nx = (int8_t)(x + dx), ny = (int8_t)(y + dy);
+            if (nx < 0 || nx > 9 || ny < 0 || ny > 9) continue;
+            if (b->st[ny * 10 + nx] >= st) return 1;
+        }
+    return 0;
+}
+
+/* 1 if any of the 8 neighbours of (x,y) is a known ship cell. */
+static uint8_t ai_moated(const Board *b, uint8_t x, uint8_t y) {
+    return ai_near(b, x, y, S_HIT);
+}
+
+/* An unfired cell next to a sunk ship: ships never touch, so it can only be water.
+   Derived, not a st[] value: fire() and the shot count mean what they always did. */
+static uint8_t is_known_water(const Board *b, uint8_t x, uint8_t y) {
+    return b->st[y * 10 + x] == S_EMPTY && ai_near(b, x, y, S_SUNK);
+}
+
 static void ai_queue(const Board *b, uint8_t x, uint8_t y) {
     if (x > 9 || y > 9) return;
-    if (b->st[y * 10 + x] != S_EMPTY) return;
+    if (b->st[y * 10 + x] != S_EMPTY || is_known_water(b, x, y)) return;
     target[y * 10 + x] = 1;
 }
 
-/* Queue the continuation of ship `o` along one axis from a hit at (x,y).
-   The walk steps over already-hit hull cells and stops at water, the edge,
-   or the first unfired hull cell (which it queues). */
-static void ai_extend(const Board *b, uint8_t o, uint8_t x, uint8_t y, uint8_t horiz) {
+static void ai_unqueue(uint8_t x, uint8_t y) {
+    if (x <= 9 && y <= 9) target[y * 10 + x] = 0;
+}
+
+/* Queue the continuation of a line of hits along one axis from the hit at (x,y).
+   The walk steps over hits, which may have landed in any order, and queues the
+   first unfired cell each way. A miss, a sunk cell or the edge ends it. Cells beside
+   a hit, across the line, are water since ships never touch: unqueue them for every
+   hit in the line, because the first hit queued its own neighbours. */
+static void ai_extend(const Board *b, uint8_t x, uint8_t y, uint8_t horiz) {
     int8_t sgn;
     for (sgn = -1; sgn <= 1; sgn += 2) {
         int8_t px = (int8_t)x, py = (int8_t)y;
         for (;;) {
             int8_t nx = horiz ? (int8_t)(px + sgn) : px;
             int8_t ny = horiz ? py : (int8_t)(py + sgn);
+            ai_unqueue(horiz ? (uint8_t)px : (uint8_t)(px - 1), horiz ? (uint8_t)(py - 1) : (uint8_t)py);
+            ai_unqueue(horiz ? (uint8_t)px : (uint8_t)(px + 1), horiz ? (uint8_t)(py + 1) : (uint8_t)py);
             if (nx < 0 || nx > 9 || ny < 0 || ny > 9) break;
-            if (b->own[ny * 10 + nx] != o) break;    /* water: the hull ended */
-            if (b->st[ny * 10 + nx] == S_EMPTY) {
-                ai_queue(b, (uint8_t)nx, (uint8_t)ny);
-                break;
-            }
-            px = nx; py = ny;                        /* another hit: walk past it */
+            if (b->st[ny * 10 + nx] == S_EMPTY) ai_queue(b, (uint8_t)nx, (uint8_t)ny);
+            if (b->st[ny * 10 + nx] != S_HIT) break;
+            px = nx; py = ny;
         }
     }
 }
 
-/* Follow-up after a hit on ship `o` at (x,y). Ships never touch, so any
-   adjacent hit is part of the same ship and reveals the orientation. */
-static void ai_hit(const Board *b, uint8_t o, uint8_t x, uint8_t y) {
+/* Follow-up after a hit at (x,y). Ships never touch, so any adjacent hit is
+   part of the same ship and reveals the orientation. */
+static void ai_hit(const Board *b, uint8_t x, uint8_t y) {
     uint8_t horiz = 0xFF;                            /* unknown */
     if ((x > 0 && b->st[y * 10 + x - 1] == S_HIT) ||
         (x < 9 && b->st[y * 10 + x + 1] == S_HIT)) horiz = 1;
     else if ((y > 0 && b->st[(y - 1) * 10 + x] == S_HIT) ||
              (y < 9 && b->st[(y + 1) * 10 + x] == S_HIT)) horiz = 0;
-    if (horiz != 0xFF) ai_extend(b, o, x, y, horiz);
+    if (horiz != 0xFF) ai_extend(b, x, y, horiz);
     else {
         ai_queue(b, (uint8_t)(x + 1), y); ai_queue(b, (uint8_t)(x - 1), y);
         ai_queue(b, x, (uint8_t)(y + 1)); ai_queue(b, x, (uint8_t)(y - 1));
     }
-}
-
-/* 1 if any of the 8 neighbours of (x,y) is a known ship cell. */
-static uint8_t ai_moated(const Board *b, uint8_t x, uint8_t y) {
-    int8_t dx, dy;
-    for (dy = -1; dy <= 1; dy++)
-        for (dx = -1; dx <= 1; dx++) {
-            int8_t nx = (int8_t)(x + dx), ny = (int8_t)(y + dy);
-            if (nx < 0 || nx > 9 || ny < 0 || ny > 9) continue;
-            if (b->st[ny * 10 + nx] >= S_HIT) return 1;
-        }
-    return 0;
 }
 
 /* HUNT: random unfired cell, moat-aware. Two passes so the loop always
@@ -275,7 +293,8 @@ static uint8_t ai_prob_pick(const Board *b) {
     return bestv ? best : ai_hunt(b);                  /* safety fallback */
 }
 
-/* EASY hunt: pure random unfired cell. */
+/* EASY hunt: pure random unfired cell, known water included. Firing there is
+   part of being easy; the other levels' hunts skip the moat. */
 static uint8_t ai_random(const Board *b) {
     uint8_t start = (uint8_t)(sim_rand() % 100);
     uint8_t i;

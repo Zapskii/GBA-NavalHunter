@@ -16,9 +16,9 @@
 #include "sim.h"
 
 enum { ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END };
-enum { C_BG, C_INK, C_GRID, C_SEA, C_SHIP, C_BAD, C_RED, C_DKRED, C_YEL, C_DIM };
+enum { C_BG, C_INK, C_GRID, C_SEA, C_SHIP, C_BAD, C_RED, C_DKRED, C_YEL, C_DIM, C_KNOWN };
 enum { VIEW_HIDDEN, VIEW_SHIPS, VIEW_END };     /* what a board shows of its fleet */
-enum { L_WATER, L_MISS, L_HIT, L_SUNK, L_SHIP, L_BAD, L_UNDRAWN = 0xFF };
+enum { L_WATER, L_MISS, L_HIT, L_SUNK, L_SHIP, L_BAD, L_KNOWN, L_UNDRAWN = 0xFF };
 
 #define BIG_X 12
 #define BIG_Y 22
@@ -40,6 +40,10 @@ typedef struct {
     const Board *b;             /* NULL: not on screen */
     u8 view;
     u8 shown[100];              /* each cell's look as last drawn */
+    /* is_known_water per cell, kept because 200 of its 3x3 scans cost 70% of a frame. It can
+       only grow when a ship sinks, and look() checks a fired cell first. */
+    u8 moat[100];
+    u8 moat_alive;              /* b->alive when moat was built */
 } Pane;
 
 /* Read by tools/e2e.py through the .sym file, so not static. */
@@ -55,8 +59,8 @@ u8 last_enemy;
 u16 shots_fired, shots_hit;
 char status_text[24], msg_text[24];
 
-static Pane big = { BIG_X, BIG_Y, 12, NULL, VIEW_HIDDEN, {0} };
-static Pane mini = { SMALL_X, SMALL_Y, 8, NULL, VIEW_SHIPS, {0} };
+static Pane big = { BIG_X, BIG_Y, 12, NULL, VIEW_HIDDEN, {0}, {0}, 0xFF };
+static Pane mini = { SMALL_X, SMALL_Y, 8, NULL, VIEW_SHIPS, {0}, {0}, 0xFF };
 static u8 preview_len, preview_legal;   /* the ship in hand during placement; 0 = none */
 static OBJ_ATTR obuf[2];                /* 0 the aiming cursor, 1 the enemy's last shot */
 static volatile u8 work_done = 1, thinking;
@@ -70,12 +74,13 @@ static u8 look(const Pane *p, int i)
     if (st == S_HIT) return L_HIT;
     if (st == S_MISS && p->view != VIEW_END) return L_MISS;     /* the end screen hides misses, as on GB */
     if (p->view != VIEW_HIDDEN && p->b->own[i] != CELL_EMPTY) return L_SHIP;
+    if (p->view != VIEW_END && p->moat[i]) return L_KNOWN;
     return L_WATER;
 }
 
 static void draw_cell(const Pane *p, int i, int l)
 {
-    static const u8 bg[] = { C_SEA, C_SEA, C_RED, C_DKRED, C_SHIP, C_BAD };
+    static const u8 bg[] = { C_SEA, C_SEA, C_RED, C_DKRED, C_SHIP, C_BAD, C_KNOWN };
     int n = p->size - 1, x = p->x + i % 10 * p->size + 1, y = p->y + i / 10 * p->size + 1;
     int w = l == L_MISS ? 3 : 5;
     gfx_rect(x, y, n, n, bg[l]);
@@ -89,6 +94,12 @@ static void draw_cell(const Pane *p, int i, int l)
 static void sync_pane(Pane *p)
 {
     int i;
+    if (p->b && p->b->alive != p->moat_alive) {
+        /* About 80 scanlines. Start only if they fit before VBlank, else carry on next frame. */
+        if (REG_VCOUNT >= 60 && REG_VCOUNT < 160) return;
+        for (i = 0; i < 100; i++) p->moat[i] = is_known_water(p->b, i % 10, i / 10);
+        p->moat_alive = p->b->alive;
+    }
     for (i = 0; p->b && i < 100; i++) {
         int want = look(p, i);
         if (p == &big && preview_len) {
@@ -176,6 +187,7 @@ static void pane_grid(Pane *p, int view)
         gfx_rect(p->x, p->y + k * p->size, 10 * p->size + 1, 1, C_GRID);
     }
     p->view = view;
+    p->moat_alive = 0xFF;
     memset(p->shown, L_UNDRAWN, sizeof p->shown);
 }
 
@@ -429,7 +441,7 @@ static void enemy_turn(void)
         x = i % 10; y = i / 10;
         r = fire(&pb, x, y, &sunk);
     }
-    if (r == 1) ai_hit(&pb, pb.own[y * 10 + x], x, y);
+    if (r == 1) ai_hit(&pb, x, y);
     if (r == 2) ai_clear_queue();
     last_enemy = y * 10 + x;
     obj_set_pos(&obuf[1], SMALL_X + 8 * x, SMALL_Y + 8 * y);
@@ -481,9 +493,10 @@ static int battle(void)
         cursor_show();
         if (!key_hit(KEY_A)) continue;
 
-        r = fire(&ob, cx, cy, &sunk);
-        if (r == 3) {           /* a spent square is refused and costs no turn */
-            msg("ALREADY SHOT");
+        /* a spent square or known water is refused and costs no turn */
+        r = is_known_water(&ob, cx, cy) ? 4 : fire(&ob, cx, cy, &sunk);
+        if (r >= 3) {
+            msg(r == 3 ? "ALREADY SHOT" : "KNOWN WATER");
             pause_frames(30);
             msg("");
             continue;
@@ -562,6 +575,7 @@ int main(void)
     pal_bg_mem[C_DKRED] = RGB15(10, 1, 2);
     pal_bg_mem[C_YEL] = RGB15(31, 31, 4);
     pal_bg_mem[C_DIM] = RGB15(16, 20, 24);
+    pal_bg_mem[C_KNOWN] = RGB15(10, 18, 26);
     pal_obj_mem[1] = RGB15(31, 31, 4);
     pal_obj_mem[2] = RGB15(31, 31, 31);
     /* Mode 4 keeps sprite tiles from index 512: lower ones are hidden by the bitmap. */

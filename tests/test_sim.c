@@ -15,44 +15,108 @@
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } } while (0)
 
-/* Play one full solo game with the AI (queue + line following + hunt) against
-   a random fleet, firing at `hard ? ai_prob_pick : ai_hunt` when the queue is
-   empty. Returns the number of shots. Also enforces the invariant that every
-   partially hit ship always has a queued unfired hull cell to chase. */
-static int sim_game(Board *b, uint8_t hard) {
+/* Play one full solo game with the AI at `level` against a random fleet. Returns the
+   number of shots. Enforces the honest queue's invariant: while any ship is partly hit,
+   the queue is not empty and holds only unfired cells. The test may read own[] and
+   hits[] to check that; the AI may not. */
+static int sim_game(Board *b, uint8_t level) {
     uint8_t s, i, shots = 0;
     clear_board(b);
     for (s = 0; s < NSHIP; s++)
         if (!place_random_one(b, s)) return -1;        /* skip on fluke */
     ai_clear_queue();
     while (b->alive && shots < 200) {
-        /* same shot picker as ai_next(): queue first, then the chosen hunt */
-        uint8_t ei = 0xFF, q;
-        for (q = 0; q < 100; q++)
-            if (target[q]) { target[q] = 0; ei = q; break; }
-        if (ei == 0xFF) ei = hard ? ai_prob_pick(b) : ai_hunt(b);
-        uint8_t sunk = 0, r;
+        uint8_t ei = ai_next(b, level), partly = 0, queued = 0, sunk = 0, r;
+        if (level > 0)                                 /* EASY's random hunt may fire there */
+            CHECK(!is_known_water(b, (uint8_t)(ei % 10), (uint8_t)(ei / 10)), "sim: AI fired at known water");
         r = fire(b, (uint8_t)(ei % 10), (uint8_t)(ei / 10), &sunk);
         shots++;
         CHECK(r != 3, "sim: AI fired at a spent cell");
-        if (r == 1) ai_hit(b, b->own[(ei / 10) * 10 + ei % 10], (uint8_t)(ei % 10), (uint8_t)(ei / 10));
+        if (r == 1) ai_hit(b, (uint8_t)(ei % 10), (uint8_t)(ei / 10));
         if (r == 2) ai_clear_queue();
-        /* invariant: a live partially-hit ship has a queued continuation */
-        for (s = 0; s < NSHIP; s++) {
-            uint8_t queued = 0;
-            if (b->hits[s] == 0 || b->hits[s] >= ship_len[s]) continue;
-            for (i = 0; i < 100; i++)
-                if (b->own[i] == s && b->st[i] == S_EMPTY && target[i]) queued = 1;
-            CHECK(queued, "sim: partially hit ship has no queued continuation");
-        }
+        for (s = 0; s < NSHIP; s++)
+            if (b->hits[s] > 0 && b->hits[s] < ship_len[s]) partly = 1;
+        for (i = 0; i < 100; i++)
+            if (target[i]) {
+                queued = 1;
+                CHECK(b->st[i] == S_EMPTY, "sim: queue holds a fired cell");
+            }
+        CHECK(!partly || queued, "sim: partly hit ship but the queue is empty");
     }
+    CHECK(b->alive == 0, "sim: the AI finished the game");
     return shots;
 }
 
-int main(void) {
+/* Every call the AI makes, from a seed, on the state a player can see: first the hunt with
+   an empty queue, then the queue rebuilt from the hits and drained. `out` is 101 bytes. */
+static void ai_trace(const Board *b, uint8_t level, uint32_t seed, uint8_t *out) {
+    uint8_t i, n = 0;
+    sim_seed(seed);
+    ai_clear_queue();
+    out[n++] = ai_next(b, level);
+    ai_clear_queue();
+    for (i = 0; i < 100; i++)
+        if (b->st[i] == S_HIT) ai_hit(b, (uint8_t)(i % 10), (uint8_t)(i / 10));
+    while (n < 101) {
+        uint8_t q, any = 0;
+        for (q = 0; q < 100; q++) if (target[q]) any = 1;
+        if (!any) break;
+        out[n++] = ai_next(b, level);
+    }
+    while (n < 101) out[n++] = 0xFF;
+}
+
+/* The fairness test: a mid-game board against a twin with the same st[] and the same sunk
+   ships, but every own[] cell and every partial hits[] count changed. The AI must not be
+   able to tell them apart. Returns how many positions had a ship partly hit, so the caller
+   can see the sweep really reached them. */
+static int fairness(uint8_t level, int games) {
+    int g, partly = 0;
+    for (g = 0; g < games; g++) {
+        Board a, t;
+        uint8_t s, i, seen = 0, ta[101], tt[101], stop;
+        sim_seed((uint32_t)(g + 1) * 0x9E3779B1u);
+        clear_board(&a);
+        for (s = 0; s < NSHIP; s++) if (!place_random_one(&a, s)) break;
+        if (s < NSHIP) continue;
+        stop = (uint8_t)(sim_rand() % 90);
+        ai_clear_queue();
+        for (i = 0; i < stop && a.alive > 1; i++) {
+            uint8_t e = ai_next(&a, level), sunk = 0, r;
+            r = fire(&a, (uint8_t)(e % 10), (uint8_t)(e / 10), &sunk);
+            if (r == 1) ai_hit(&a, (uint8_t)(e % 10), (uint8_t)(e / 10));
+            if (r == 2) ai_clear_queue();
+        }
+        t = a;
+        /* random, not a swap of hull and water: a swap keeps which neighbours match, and a
+           line walk that reads own[] then behaves the same on both boards */
+        for (i = 0; i < 100; i++) {
+            t.own[i] = (uint8_t)(sim_rand() % (NSHIP + 1));
+            if (t.own[i] == NSHIP) t.own[i] = CELL_EMPTY;
+        }
+        for (s = 0; s < NSHIP; s++) {
+            if (a.hits[s] >= ship_len[s]) continue;
+            if (a.hits[s]) seen = 1;
+            t.hits[s] = (uint8_t)(a.hits[s] ? a.hits[s] - 1 : ship_len[s] - 1);
+        }
+        partly += seen;
+        ai_trace(&a, level, (uint32_t)g + 77, ta);
+        ai_trace(&t, level, (uint32_t)g + 77, tt);
+        for (i = 0; i < 101; i++)
+            if (ta[i] != tt[i]) {
+                printf("FAIL: fairness: level %d game %d call %d: %d vs %d\n", level, g, i, ta[i], tt[i]);
+                fails++;
+                return partly;
+            }
+    }
+    return partly;
+}
+
+int main(int argc, char **argv) {
     Board b;
     uint8_t i, t;
-    sim_seed(8);
+    uint32_t seed = argc > 1 ? (uint32_t)strtoul(argv[1], 0, 0) : 8;    /* a seed to sweep the checks with */
+    sim_seed(seed);
 
     /* ---- place_ship geometry ---- */
     clear_board(&b);
@@ -138,7 +202,7 @@ int main(void) {
     place_ship(&b, 4, 4, 3, 1, 2);            /* cruiser horizontal, row 4, cols 4-6 */
     b.st[4 * 10 + 5] = S_HIT; b.hits[2] = 1;
     ai_clear_queue();
-    ai_hit(&b, 2, 5, 4);
+    ai_hit(&b, 5, 4);
     CHECK(target[4 * 10 + 4] == 1, "hit queues left neighbour");
     CHECK(target[4 * 10 + 6] == 1, "hit queues right neighbour");
     CHECK(target[3 * 10 + 5] == 1, "hit queues above");
@@ -158,7 +222,7 @@ int main(void) {
     place_ship(&b, 2, 0, 5, 0, 0);            /* carrier vertical, col 2, rows 0-4 */
     b.st[2] = S_HIT; b.st[2 * 10 + 1] = S_HIT; b.hits[0] = 2;
     ai_clear_queue();
-    ai_hit(&b, 0, 2, 1);
+    ai_hit(&b, 2, 1);
     CHECK(target[2 * 10 + 2] == 1, "line extended down to the next hull cell");
     CHECK(target[1 * 10 + 1] == 0, "left diagonal not queued");
     CHECK(target[1 * 10 + 2] == 0, "left cross not queued");
@@ -170,9 +234,83 @@ int main(void) {
     b.st[2] = S_HIT; b.st[2 * 10 + 1] = S_HIT; b.st[2 * 10 + 2] = S_HIT;
     b.hits[0] = 3;
     ai_clear_queue();
-    ai_hit(&b, 0, 2, 1);
+    ai_hit(&b, 2, 1);
     CHECK(target[3 * 10 + 2] == 1, "walk passed 3 hits, queued the far end");
     CHECK(target[2 * 10 + 0] == 0, "already-hit cell not re-queued");
+
+    /* ---- AI: it cannot see the hull end, so it fires past it. own[] says (6,4) is water. ---- */
+    clear_board(&b);
+    place_ship(&b, 3, 4, 3, 1, 2);            /* cruiser, row 4, cols 3-5 */
+    b.st[4 * 10 + 4] = S_HIT; b.st[4 * 10 + 5] = S_HIT; b.hits[2] = 2;
+    ai_clear_queue();
+    ai_hit(&b, 5, 4);
+    CHECK(target[4 * 10 + 3] == 1, "line queued on the side with hull");
+    CHECK(target[4 * 10 + 6] == 1, "line queued past the hidden end of the hull");
+
+    /* ---- AI: a miss ends the walk on that side ---- */
+    b.st[4 * 10 + 6] = S_MISS;
+    ai_clear_queue();
+    ai_hit(&b, 4, 4);
+    CHECK(target[4 * 10 + 3] == 1 && target[4 * 10 + 6] == 0 && target[4 * 10 + 7] == 0, "walk stops at a miss");
+
+    /* ---- AI: the second hit clears the FIRST hit's cross neighbours too ---- */
+    clear_board(&b);
+    place_ship(&b, 5, 3, 3, 0, 2);            /* cruiser vertical, col 5, rows 3-5 */
+    b.st[5 * 10 + 5] = S_HIT;
+    ai_clear_queue();
+    ai_hit(&b, 5, 5);
+    b.st[4 * 10 + 5] = S_HIT;
+    ai_hit(&b, 5, 4);
+    CHECK(target[3 * 10 + 5] == 1 && target[6 * 10 + 5] == 1, "both line ends queued");
+    CHECK(target[5 * 10 + 4] == 0 && target[5 * 10 + 6] == 0, "first hit's cross neighbours cleared");
+
+    /* ---- AI: the queue skips known water ---- */
+    clear_board(&b);
+    place_ship(&b, 0, 0, 1, 1, 5);
+    fire(&b, 0, 0, &t);
+    b.st[2 * 10 + 1] = S_HIT;
+    ai_clear_queue();
+    ai_hit(&b, 1, 2);
+    CHECK(target[1 * 10 + 1] == 0, "known water next to a hit not queued");
+    CHECK(target[3 * 10 + 1] == 1, "the other neighbours still are");
+
+    /* ---- known water: derived from st[], around sunk cells only ---- */
+    clear_board(&b);
+    place_ship(&b, 5, 5, 1, 1, 5);
+    place_ship(&b, 0, 0, 2, 1, 3);
+    {
+        uint8_t x, y, sunk = 0;
+        CHECK(!is_known_water(&b, 4, 4), "nothing known before a sinking");
+        CHECK(fire(&b, 0, 0, &sunk) == 1, "a hit, not sunk");
+        CHECK(!is_known_water(&b, 0, 1), "a hit marks no water");
+        b.st[4 * 10 + 4] = S_MISS;
+        fire(&b, 5, 5, &sunk);
+        for (y = 3; y <= 7; y++)
+            for (x = 3; x <= 7; x++) {
+                uint8_t ring = x >= 4 && x <= 6 && y >= 4 && y <= 6 && !(x == 5 && y == 5) && !(x == 4 && y == 4);
+                CHECK(is_known_water(&b, x, y) == ring, "known water is exactly the unfired 3x3 around a sunk cell");
+            }
+        /* no new st[] value: fire() still takes the cell, as a counted miss (EASY does this) */
+        CHECK(b.st[4 * 10 + 5] == S_EMPTY, "known water stays S_EMPTY in st[]");
+        CHECK(fire(&b, 5, 4, &sunk) == 0 && b.st[4 * 10 + 5] == S_MISS, "fire treats known water as a plain miss");
+    }
+    clear_board(&b);
+    place_ship(&b, 0, 0, 1, 1, 5);
+    fire(&b, 0, 0, &t);
+    CHECK(is_known_water(&b, 1, 1) && !is_known_water(&b, 2, 0) && !is_known_water(&b, 0, 0), "a corner: the moat stops at the edge");
+
+    /* ---- every level plays out with the queue invariant held (sim_game's CHECKs) ---- */
+    for (t = 0; t < 3; t++) {
+        int game;
+        for (game = 0; game < 100; game++) sim_game(&b, t);
+    }
+
+    /* ---- the fairness test, at every level (Phase 4's level gets added here) ---- */
+    for (t = 0; t < 3; t++) {
+        int partly = fairness(t, 1000);
+        printf("fairness: level %d, %d positions with a ship partly hit\n", t, partly);
+        CHECK(partly > 100, "fairness sweep reached partly hit ships");
+    }
 
     /* ---- AI: hunt skips dead cells next to a sunk ship ---- */
     clear_board(&b);
@@ -208,18 +346,19 @@ int main(void) {
         if (fails) break;
     }
 
-    /* strength: full solo games, HARD (prob) vs NORMAL (random) hunt, same
-       queue/target logic; HARD must win in clearly fewer shots */
+    /* strength: full solo games, HARD (prob) vs NORMAL (random) hunt, same queue logic. Over
+       2000 games and 60 seeds the shots saved per game measured 4.77 to 6.31, and -0.68 to
+       0.62 with ai_prob_pick neutered. The bar of 2.75 sits in the middle of that gap. */
     {
         int game, hard_total = 0, rand_total = 0;
-        for (game = 0; game < 100; game++) {
-            hard_total += sim_game(&b, 1);
-            rand_total += sim_game(&b, 0);
+        sim_seed(seed);                       /* fairness() above seeds for itself */
+        for (game = 0; game < 2000; game++) {
+            hard_total += sim_game(&b, 2);
+            rand_total += sim_game(&b, 1);
         }
-        printf("sim: hard %d avg, random %d avg (100 games each)\n",
-               hard_total / 100, rand_total / 100);
-        CHECK(hard_total < rand_total - 500, "prob hunt clearly beats random hunt");
-        (void)hard_total; (void)rand_total;
+        printf("sim: hard %.2f avg, random %.2f avg (2000 games each)\n",
+               hard_total / 2000.0, rand_total / 2000.0);
+        CHECK(rand_total - hard_total > 5500, "prob hunt clearly beats random hunt");
     }
 
     printf("test_place: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

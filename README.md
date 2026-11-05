@@ -8,7 +8,7 @@ Playable from the title to the end screen, with both boards always on screen, in
 - Title: START. Menu: A random fleet, B place your own, SELECT cycles the level (EASY, NORMAL, HARD).
 - Placing: d-pad moves, B turns, A places, START randomises the rest. Ships may not touch.
 - Battle: d-pad aims, A fires. Your board, with the enemy's last shot marked, is on the right, over the
-  list of enemy ships.
+  list of enemy ships. Cells around a sunk ship show as pale water: ships never touch, so they cannot be fired at.
 - End: START plays again.
 
 Build with Docker (`devkitpro/devkitarm`): `make`. `make run` opens mGBA, `make test` checks the rules on the

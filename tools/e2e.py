@@ -8,7 +8,7 @@ from PIL import Image
 DISPCNT, VRAM, OAM = 0x04000000, 0x06000000, 0x07000000
 SND4ENV, SND4POLY, SNDSTAT, SND1ENV = 0x04000079, 0x0400007C, 0x04000084, 0x04000063
 ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END = range(7)
-C_BG, C_INK, C_GRID, C_SEA, C_SHIP, C_BAD, C_RED, C_DKRED, C_YEL, C_DIM = range(10)  # main.c's palette
+C_BG, C_INK, C_GRID, C_SEA, C_SHIP, C_BAD, C_RED, C_DKRED, C_YEL, C_DIM, C_KNOWN = range(11)  # main.c's palette
 A, B, SELECT, START, RIGHT, LEFT, UP, DOWN = 1, 2, 4, 8, 16, 32, 64, 128
 S_EMPTY, S_MISS, S_HIT, S_SUNK = range(4)
 EMPTY = 255
@@ -82,6 +82,11 @@ class Emu:
 
 def cells(own, s): return [i for i in range(100) if own[i] == s]
 def water(own): return [i for i in range(100) if own[i] == EMPTY]
+
+def around(i):
+    """The 8 cells next to cell i, on the board."""
+    return [(i // 10 + dy) * 10 + i % 10 + dx for dy in (-1, 0, 1) for dx in (-1, 0, 1)
+            if (dx or dy) and 0 <= i % 10 + dx <= 9 and 0 <= i // 10 + dy <= 9]
 
 def legal_fleet(own):
     for i in range(100):
@@ -305,6 +310,37 @@ def main():
     e.shot("10-sunk")
     check(e.battle_ready(), "turn comes back after the sinking")
 
+    # --- known water: the cells around a sunk ship draw as water, on both boards, and are refused
+    st = e.board("ob")[1]
+    ring = [i for i in around(sub) if st[i] == S_EMPTY]
+    check(len(ring) >= 2, f"unfired cells around the sunk sub: {ring}")
+    check(all(e.cell_px(BIG, i) == C_KNOWN for i in ring), "they draw as known water on the enemy board")
+    check(all(e.cell_px(BIG, i, 5, 5) == C_KNOWN for i in ring), "with no mark in the middle, unlike a fired miss")
+    check(e.cell_px(BIG, miss, 5, 5) == C_INK, "a fired miss still has its mark")
+    check(set(st) <= {S_EMPTY, S_MISS, S_HIT, S_SUNK} and all(st[i] == S_EMPTY for i in ring), "no new st[] value: they are still unfired")
+    own_p, st_p, hits_p, alive_p = e.board("pb")
+    st_p, hits_p = bytearray(st_p), bytearray(hits_p)
+    psub = cells(own_p, 6)[0]
+    if st_p[psub] != S_SUNK: alive_p -= 1
+    st_p[psub], hits_p[6] = S_SUNK, 1
+    e.poke_board("pb", own_p, st_p, hits_p, alive_p)
+    e.run(4)
+    pring = [i for i in around(psub) if st_p[i] == S_EMPTY]
+    check(len(pring) >= 2 and all(e.cell_px(SMALL, i) == C_KNOWN for i in pring), f"and on your board: {pring}")
+    before = e.board("pb")[1], e.board("ob")[1], e.u16("shots_fired"), e.u16("shots_hit"), e.u8("last_enemy")
+    e.shoot(ring[0]); e.run(1)
+    check(e.text("msg_text") == "KNOWN WATER", f"firing there is refused: {e.text('msg_text')!r}")
+    check(e.state() == ST_BATTLE, "still your turn")
+    im = e.shot("10b-known-water")
+    known = im.getpixel(((BIG[0] + 12 * (ring[-1] % 10) + 3) * 2, (BIG[1] + 12 * (ring[-1] // 10) + 3) * 2))
+    sea = next(i for i in range(100) if st[i] == S_EMPTY and i not in ring and e.cell_px(BIG, i) == C_SEA)
+    plain = im.getpixel(((BIG[0] + 12 * (sea % 10) + 3) * 2, (BIG[1] + 12 * (sea // 10) + 3) * 2))
+    check(known != plain, f"known water looks different from open sea on screen: {known} {plain}")
+    e.run(40)
+    after = e.board("pb")[1], e.board("ob")[1], e.u16("shots_fired"), e.u16("shots_hit"), e.u8("last_enemy")
+    check(before == after, f"it costs no turn or stat: shots_fired still {after[2]}")
+    check(e.text("msg_text") == "", "and the refusal clears")
+
     # --- win, set up by poke; both fleets revealed
     last = last_one_alive(e, "ob", False)
     e.run(4)
@@ -324,6 +360,7 @@ def main():
     check(all(e.cell_px(BIG, i) != C_SEA for i in range(100) if own_o[i] != EMPTY), "enemy fleet fully revealed")
     check(all(e.cell_px(SMALL, i) != C_SEA for i in range(100) if own_p[i] != EMPTY), "your fleet fully revealed")
     check(e.cell_px(BIG, miss) == C_SEA, "the end screen hides misses, as on GB")
+    check(C_KNOWN not in {e.cell_px(BIG, i) for i in range(100)}, "and known water with them")
     check(e.peek(OAM + 1)[0] & 3 == 2 and e.peek(OAM + 9)[0] & 3 == 2, "cursor and marker hidden")
     e.shot("11-win")
     e.tap(A); e.tap(SELECT); e.run(5)
