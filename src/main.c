@@ -27,13 +27,17 @@ enum { L_WATER, L_MISS, L_HIT, L_SUNK, L_SHIP, L_BAD, L_KNOWN, L_UNDRAWN = 0xFF 
 #define PANEL_X 144
 #define PANEL_Y 103
 #define THINK_FRAMES 30         /* the enemy's pause; the AI runs inside it */
+#define ADMIRAL 3
+/* ADMIRAL samples until this scanline, which leaves the frame's own work 80 lines: the idle board
+   scan's 56 lines (68,950 cycles) and the longest mc_step that may just have started. */
+#define MC_STOP_LINE 80
 #define REPEAT_DELAY 18         /* the GB's key repeat: ~0.30 s before it kicks in */
 #define REPEAT_RATE   9         /* then ~6.7 moves a second */
 
 static const char *const ship_name[NSHIP] = {
     "CARRIER", "BATTLESHIP", "CRUISER", "DESTROYER", "DESTROYER", "SUB", "SUB"
 };
-static const char *const level_name[3] = { "EASY", "NORMAL", "HARD" };
+static const char *const level_name[4] = { "EASY", "NORMAL", "HARD", "ADMIRAL" };
 
 typedef struct {
     int x, y, size;
@@ -49,7 +53,10 @@ typedef struct {
 /* Read by tools/e2e.py through the .sym file, so not static. */
 u8 state = ST_BOOT;
 volatile u32 frames, frame_drops;
-volatile u32 ai_cycles;         /* the slowest ai_next so far, in CPU cycles */
+volatile u32 ai_cycles;         /* the slowest ai_next or mc_pick so far, in CPU cycles */
+volatile u32 worst_frame;       /* the most cycles a frame's work has taken so far */
+u16 samples, sample_tries;      /* ADMIRAL's last turn: valid fleets, and fleets tried */
+u8 think_frames;                /* frames the enemy's last turn spent thinking */
 volatile u32 cells_drawn;
 Board pb, ob;                   /* your waters, enemy waters */
 u8 ai_level = 1;
@@ -65,6 +72,7 @@ static u8 preview_len, preview_legal;   /* the ship in hand during placement; 0 
 static OBJ_ATTR obuf[2];                /* 0 the aiming cursor, 1 the enemy's last shot */
 static volatile u8 work_done = 1, thinking;
 static u8 held_btn, held_timer;
+static u32 frame_start;
 
 /* ---------------------------------------------------------------- the boards */
 static u8 look(const Pane *p, int i)
@@ -131,20 +139,30 @@ static void on_vbl(void)
     work_done = 0;
 }
 
+/* Timers 2 and 3 cascaded: a free-running 32-bit count of CPU cycles. Low half read between two
+   reads of the high half, or a carry between the reads puts it 65,536 out. */
+static u32 cycles(void)
+{
+    u32 hi, lo;
+    do { hi = REG_TM3D; lo = REG_TM2D; } while (hi != REG_TM3D);
+    return hi << 16 | lo;
+}
+
 /* The one place the game waits. */
 static void wait_frame(void)
 {
+    u32 cost;
     sync_boards();
+    cost = cycles() - frame_start;
+    if (cost > worst_frame) worst_frame = cost;
     work_done = 1;
     VBlankIntrWait();
+    frame_start = cycles();
     oam_copy(oam_mem, obuf, 2);
     key_poll();
 }
 
 static void pause_frames(int n) { while (n--) wait_frame(); }
-
-/* Timers 2 and 3 cascaded: a free-running 32-bit count of CPU cycles. */
-static u32 cycles(void) { return (u32)REG_TM3D << 16 | REG_TM2D; }
 
 /* ---------------------------------------------------------------- text */
 static void text_row(int x, int y, int w, const char *s, int c)
@@ -309,7 +327,7 @@ static int menu(void)
         if (key_hit(KEY_A)) return 0;
         if (key_hit(KEY_B)) return 1;
         if (key_hit(KEY_SELECT)) {
-            ai_level = (ai_level + 1) % 3;
+            ai_level = (ai_level + 1) % 4;
             menu_level();
         }
     }
@@ -409,6 +427,27 @@ static void shot_result(int r, int sunk, const char *who, const char *miss, cons
     flash_hit();
 }
 
+/* ADMIRAL samples through the whole pause, a frame's worth at a time, so the frame loop keeps
+   running and its frames count like any others. The shot is picked at the top of the frame after. */
+static int admiral_think(void)
+{
+    u32 t0 = frames, c;
+    int i;
+    mc_begin(&pb);
+    while (frames - t0 < THINK_FRAMES) {
+        while (REG_VCOUNT >= 160 || REG_VCOUNT < MC_STOP_LINE) mc_step(&pb);
+        wait_frame();
+    }
+    think_frames = frames - t0;
+    samples = mc_samples;
+    sample_tries = mc_tries;
+    c = cycles();
+    i = mc_pick(&pb);
+    c = cycles() - c;
+    if (c > ai_cycles) ai_cycles = c;
+    return i;
+}
+
 /* ai_next at HARD takes several frames in Thumb from ROM (tools/e2e.py measures it and fails
    if it outgrows the pause). It runs inside the enemy's pause, where nothing on screen is
    moving, so it does not count as a dropped frame. The VBlank IRQ still runs throughout. */
@@ -423,6 +462,7 @@ static int enemy_think(void)
     wait_frame();
     thinking = 0;
     while (frames - t0 < THINK_FRAMES) wait_frame();
+    think_frames = frames - t0;
     return i;
 }
 
@@ -432,7 +472,7 @@ static void enemy_turn(void)
     u8 sunk = 0;
     status("ENEMY TURN");
     obj_hide(&obuf[0]);
-    i = enemy_think();
+    i = ai_level == ADMIRAL ? admiral_think() : enemy_think();
     x = i % 10; y = i / 10;
     r = fire(&pb, x, y, &sunk);
     if (r == 3) {

@@ -34,6 +34,9 @@ static int sim_game(Board *b, uint8_t level) {
         CHECK(r != 3, "sim: AI fired at a spent cell");
         if (r == 1) ai_hit(b, (uint8_t)(ei % 10), (uint8_t)(ei / 10));
         if (r == 2) ai_clear_queue();
+        /* ADMIRAL can have two ships partly hit, and a sinking clears the queue for both, so
+           what must hold is the queue mc_pick falls back on: the rebuilt one. */
+        if (level == 3) ai_requeue(b);
         for (s = 0; s < NSHIP; s++)
             if (b->hits[s] > 0 && b->hits[s] < ship_len[s]) partly = 1;
         for (i = 0; i < 100; i++)
@@ -64,6 +67,278 @@ static void ai_trace(const Board *b, uint8_t level, uint32_t seed, uint8_t *out)
         out[n++] = ai_next(b, level);
     }
     while (n < 101) out[n++] = 0xFF;
+}
+
+/* Deal a game the way measure.c does, so every level meets the same fleets. */
+static void deal(Board *b, int g) {
+    uint8_t s;
+    sim_seed((uint32_t)(g + 1) * 0x9E3779B1u);
+    for (;;) {
+        clear_board(b);
+        for (s = 0; s < NSHIP; s++) if (!place_random_one(b, s)) break;
+        if (s == NSHIP) return;
+    }
+}
+
+/* Judge the fleet mc_step just made, from st[] and sunk status alone and none of its code: every
+   live ship once, on the board, off fired water and off anything by a sunk ship, touching no
+   other hull, not all hits, and every hit covered. Adds the fleet's unfired cells to score. */
+static int mc_fleet_legal(const Board *b, uint32_t *score) {
+    int8_t grid[100];
+    uint8_t seen = 0, want = 0;
+    int i, k, dx, dy;
+    for (i = 0; i < 100; i++) grid[i] = -1;
+    for (i = 0; i < NSHIP; i++) if (b->hits[i] < ship_len[i]) want |= (uint8_t)(1u << i);
+    for (i = 0; i < mc_placed; i++) {
+        const McShip *f = &mc_fleet[i];
+        int unfired = 0;
+        if (seen >> f->s & 1) return 0;
+        seen |= (uint8_t)(1u << f->s);
+        for (k = 0; k < ship_len[f->s]; k++) {
+            int x = f->x + (f->horiz ? k : 0), y = f->y + (f->horiz ? 0 : k);
+            if (x > 9 || y > 9 || grid[y * 10 + x] != -1) return 0;
+            if (b->st[y * 10 + x] == S_MISS || b->st[y * 10 + x] == S_SUNK) return 0;
+            if (b->st[y * 10 + x] == S_EMPTY) unfired = 1;
+            grid[y * 10 + x] = (int8_t)f->s;
+        }
+        if (!unfired) return 0;
+    }
+    if (seen != want) return 0;
+    for (i = 0; i < 100; i++) {
+        if (b->st[i] == S_HIT && grid[i] == -1) return 0;
+        if (grid[i] == -1) continue;
+        if (b->st[i] == S_EMPTY) score[i]++;
+        for (dy = -1; dy <= 1; dy++)
+            for (dx = -1; dx <= 1; dx++) {
+                int x = i % 10 + dx, y = i / 10 + dy;
+                if (x < 0 || x > 9 || y < 0 || y > 9) continue;
+                if (b->st[y * 10 + x] == S_SUNK) return 0;
+                if (grid[y * 10 + x] != -1 && grid[y * 10 + x] != grid[i]) return 0;
+            }
+    }
+    return 1;
+}
+
+/* An ADMIRAL shot must be unfired and not known water, unless known water is all that is left. */
+static void admiral_shot_ok(const Board *b, uint8_t i, const char *what) {
+    uint8_t c, other = 0;
+    if (i >= 100 || b->st[i] != S_EMPTY) { printf("FAIL: %s: fired at spent cell %d\n", what, i); fails++; return; }
+    for (c = 0; c < 100; c++)
+        if (b->st[c] == S_EMPTY && !is_known_water(b, (uint8_t)(c % 10), (uint8_t)(c / 10))) other = 1;
+    if (other && is_known_water(b, (uint8_t)(i % 10), (uint8_t)(i / 10))) {
+        printf("FAIL: %s: fired at known water %d\n", what, i);
+        fails++;
+    }
+}
+
+static void admiral_checks(void) {
+    Board b;
+    int g, k;
+    uint8_t i, x, y, sunk = 0;
+
+    /* every sampled fleet is legal and covers the hits, through whole games. mc_score holds what
+       the valid fleets say and nothing else. */
+    {
+        long fleets = 0, with_hits = 0, two_damaged = 0;
+        for (g = 0; g < 200; g++) {
+            int n = 0;
+            deal(&b, g);
+            ai_clear_queue();
+            while (b.alive && n++ < 200) {
+                uint32_t score[100] = {0};
+                uint8_t any_hit = 0, damaged = 0, s, pick;
+                for (s = 0; s < NSHIP; s++) if (b.hits[s] && b.hits[s] < ship_len[s]) damaged++;
+                for (i = 0; i < 100; i++) if (b.st[i] == S_HIT) any_hit = 1;
+                mc_begin(&b);
+                for (k = 0; k < 64; k++)
+                    if (mc_step(&b)) {
+                        fleets++;
+                        with_hits += any_hit;
+                        two_damaged += damaged > 1;
+                        if (!mc_fleet_legal(&b, score)) { printf("FAIL: sampled fleet is illegal (game %d)\n", g); fails++; return; }
+                    }
+                for (i = 0; i < 100; i++)
+                    if (mc_score[i] != score[i]) { printf("FAIL: mc_score[%d] %d, the valid fleets say %d\n", i, mc_score[i], (int)score[i]); fails++; return; }
+                pick = mc_pick(&b);
+                admiral_shot_ok(&b, pick, "sampled game");
+                {
+                    uint8_t r = fire(&b, (uint8_t)(pick % 10), (uint8_t)(pick / 10), &sunk);
+                    if (r == 1) ai_hit(&b, (uint8_t)(pick % 10), (uint8_t)(pick / 10));
+                    if (r == 2) ai_clear_queue();
+                }
+            }
+            CHECK(b.alive == 0, "ADMIRAL finishes a game");
+        }
+        printf("admiral: %ld sampled fleets judged legal, %ld with a ship partly hit, %ld with two\n", fleets, with_hits, two_damaged);
+        CHECK(with_hits > 10000, "the property sweep reached partly hit ships");
+    }
+
+    /* a partly hit ship: every fleet runs on from a lone hit, so a neighbour usually tops the map.
+       Not always: open water can score as high, and sampling is free to fire there. */
+    clear_board(&b);
+    b.st[5 * 10 + 5] = S_HIT;
+    ai_clear_queue();
+    {
+        int chased = 0;
+        for (k = 0; k < 40; k++) {
+            uint8_t n = ai_admiral(&b, 500);
+            CHECK(mc_samples >= MC_MIN_SAMPLES, "a lone hit leaves plenty of valid fleets");
+            CHECK(mc_score[5 * 10 + 5] == 0, "a hit cell is not scored");
+            CHECK(mc_score[5 * 10 + 4] + mc_score[5 * 10 + 6] + mc_score[4 * 10 + 5] + mc_score[6 * 10 + 5] >= mc_samples,
+                  "every fleet runs on from the hit");
+            CHECK(mc_score[4 * 10 + 4] == 0 && mc_score[6 * 10 + 6] == 0, "the moat of a hit gets no score");
+            chased += n == 5 * 10 + 4 || n == 5 * 10 + 6 || n == 4 * 10 + 5 || n == 6 * 10 + 5;
+        }
+        printf("admiral: a lone hit was chased on %d of 40 shots\n", chased);
+        CHECK(chased >= 30, "sampling chases a hit without the queue");
+    }
+
+    /* a live ship cannot be all hits: with only a sub and a cruiser afloat, a hit means cruiser */
+    clear_board(&b);
+    b.hits[0] = 5; b.hits[1] = 4; b.hits[3] = 2; b.hits[4] = 2; b.hits[5] = 1;      /* cruiser, one sub */
+    b.st[4 * 10 + 4] = S_HIT;
+    b.st[5 * 10 + 4] = S_HIT;
+    mc_begin(&b);
+    for (k = 0; k < 400; k++) mc_step(&b);
+    CHECK(mc_samples >= MC_MIN_SAMPLES, "hits leave valid fleets");
+    CHECK(mc_score[3 * 10 + 4] + mc_score[6 * 10 + 4] >= mc_samples, "two hits and a live cruiser: one end or the other, in every fleet");
+
+    /* few valid fleets: every water cell fired, so nearly all that is left is the real fleet */
+    {
+        int sampled = 0, fell_back = 0;
+        for (g = 0; g < 300; g++) {
+            uint8_t n;
+            deal(&b, g);
+            for (i = 0; i < 100; i++) if (b.own[i] == CELL_EMPTY) b.st[i] = S_MISS;
+            for (i = 0; i < 100; i++)
+                if (b.own[i] != CELL_EMPTY && sim_rand() % 3 == 0 && b.hits[b.own[i]] + 1 < ship_len[b.own[i]]) {
+                    b.st[i] = S_HIT;
+                    b.hits[b.own[i]]++;
+                }
+            ai_clear_queue();
+            n = ai_admiral(&b, 400);
+            if (mc_samples >= MC_MIN_SAMPLES) sampled++; else fell_back++;
+            admiral_shot_ok(&b, n, "few valid fleets");
+            CHECK(b.own[n] != CELL_EMPTY, "with only hull left unfired, the shot is a hit");
+        }
+        printf("admiral: few valid fleets: %d sampled, %d fell back\n", sampled, fell_back);
+        CHECK(sampled + fell_back == 300, "every position gave a shot");
+    }
+
+    /* few valid fleets: rare, but the sampler can reach them. Given time, it finds one. */
+    for (g = 0; g < 100; g++) {
+        deal(&b, g);
+        for (i = 0; i < 100; i++) {
+            if (b.own[i] == CELL_EMPTY) b.st[i] = S_MISS;
+            else if (b.own[i] < 3) { fire(&b, (uint8_t)(i % 10), (uint8_t)(i / 10), &sunk); }
+        }
+        mc_begin(&b);
+        for (k = 0; k < 60000 && !mc_samples; k++) mc_step(&b);
+        CHECK(mc_samples > 0, "the sampler can find a fleet that fills what is left");
+    }
+
+    /* no valid fleet at all: a tight manual layout can leave a ship unplaced (place_fleet's
+       START), so the carrier here is live to the AI and exists nowhere. A whole game plays out. */
+    {
+    int reached = 0;
+    for (g = 0; g < 50; g++) {
+        int n = 0;
+        uint8_t zero = 0;
+        deal(&b, g);
+        for (i = 0; i < 100; i++) if (b.own[i] == 0) b.own[i] = CELL_EMPTY;
+        b.alive = NSHIP - 1;
+        ai_clear_queue();
+        while (b.alive && n++ < 200) {
+            uint8_t p = ai_admiral(&b, 200), r;
+            if (mc_samples == 0) zero = 1;
+            admiral_shot_ok(&b, p, "missing ship");
+            r = fire(&b, (uint8_t)(p % 10), (uint8_t)(p / 10), &sunk);
+            if (r == 1) ai_hit(&b, (uint8_t)(p % 10), (uint8_t)(p / 10));
+            if (r == 2) ai_clear_queue();
+        }
+        CHECK(b.alive == 0, "a game with no possible fleet still finishes");
+        reached += zero;
+    }
+    CHECK(reached > 25, "and most of them did run out of valid fleets");
+    }
+
+    /* more hits than ships could cover, and a hit next to a sunk ship: odd, and must not hang */
+    clear_board(&b);
+    for (y = 0; y < 10; y += 2) for (x = 0; x < 10; x += 2) b.st[y * 10 + x] = S_HIT;
+    i = ai_admiral(&b, 200);
+    CHECK(mc_samples == 0, "25 scattered hits have no valid fleet");
+    CHECK(b.st[i] == S_EMPTY, "and the fallback still gives an unfired cell");
+    clear_board(&b);
+    b.st[0] = S_SUNK; b.hits[5] = 1; b.st[1] = S_HIT;
+    i = ai_admiral(&b, 200);
+    CHECK(mc_samples == 0 && b.st[i] == S_EMPTY, "a hit touching a sunk ship has no valid fleet, and a legal shot");
+
+    /* the fallback rebuilds its queue: A sinks with B partly hit, and the sinking clears the queue */
+    clear_board(&b);
+    place_ship(&b, 0, 0, 1, 1, 5);
+    place_ship(&b, 5, 5, 2, 1, 3);
+    fire(&b, 0, 0, &sunk);
+    fire(&b, 5, 5, &sunk);
+    ai_clear_queue();
+    i = ai_admiral(&b, 0);
+    CHECK(i == 5 * 10 + 4 || i == 5 * 10 + 6 || i == 4 * 10 + 5 || i == 6 * 10 + 5, "the fallback finds the live hit after a sinking cleared the queue");
+
+    /* the line is 50 valid fleets: below it the queue fires, whatever the fleets say. The queue's
+       first cell is the one above the hit, and the fleets alone would pick it about one time in 4. */
+    clear_board(&b);
+    b.st[5 * 10 + 5] = S_HIT;
+    for (k = 0; k < 40; k++) {
+        mc_begin(&b);
+        while (mc_samples < MC_MIN_SAMPLES - 1) mc_step(&b);
+        CHECK(mc_pick(&b) == 4 * 10 + 5, "with too few fleets, the honest queue takes the shot");
+    }
+    CHECK(MC_MIN_SAMPLES == 50, "the fallback line is about 50 samples");
+
+    /* a queue left from earlier hits holds no spent cell, once ADMIRAL has fired one of them */
+    clear_board(&b);
+    b.st[5 * 10 + 5] = S_HIT;
+    ai_clear_queue();
+    ai_hit(&b, 5, 5);
+    i = ai_admiral(&b, MC_TRIES);
+    CHECK(target[i] == 0, "the shot leaves the queue");
+
+    /* nothing but known water left: fire there rather than hang */
+    clear_board(&b);
+    for (i = 0; i < 100; i++) b.st[i] = S_MISS;
+    b.st[4 * 10 + 4] = S_SUNK; b.hits[5] = 1;
+    b.st[4 * 10 + 5] = S_EMPTY;
+    i = ai_admiral(&b, 200);
+    CHECK(i == 4 * 10 + 5, "known water when nothing else is left");
+
+    /* no samples at all, every turn: the fallback alone plays legal whole games */
+    for (g = 0; g < 200; g++) {
+        int n = 0;
+        deal(&b, g);
+        ai_clear_queue();
+        while (b.alive && n++ < 200) {
+            uint8_t p = ai_admiral(&b, 0), r;
+            admiral_shot_ok(&b, p, "fallback game");
+            r = fire(&b, (uint8_t)(p % 10), (uint8_t)(p / 10), &sunk);
+            if (r == 1) ai_hit(&b, (uint8_t)(p % 10), (uint8_t)(p / 10));
+            if (r == 2) ai_clear_queue();
+        }
+        CHECK(b.alive == 0, "the fallback alone finishes a game");
+    }
+}
+
+/* Solo games at a tries cap of what the ROM reaches, on the same fleets as HARD. */
+static int solo_shots(Board *b, int g, uint8_t level, uint16_t tries) {
+    int n = 0;
+    deal(b, g);
+    ai_clear_queue();
+    while (b->alive && n < 200) {
+        uint8_t i = level == 3 ? ai_admiral(b, tries) : ai_next(b, level), sunk = 0;
+        uint8_t r = fire(b, (uint8_t)(i % 10), (uint8_t)(i / 10), &sunk);
+        n++;
+        if (r == 1) ai_hit(b, (uint8_t)(i % 10), (uint8_t)(i / 10));
+        if (r == 2) ai_clear_queue();
+    }
+    return n;
 }
 
 /* The fairness test: a mid-game board against a twin with the same st[] and the same sunk
@@ -300,13 +575,13 @@ int main(int argc, char **argv) {
     CHECK(is_known_water(&b, 1, 1) && !is_known_water(&b, 2, 0) && !is_known_water(&b, 0, 0), "a corner: the moat stops at the edge");
 
     /* ---- every level plays out with the queue invariant held (sim_game's CHECKs) ---- */
-    for (t = 0; t < 3; t++) {
+    for (t = 0; t < 4; t++) {
         int game;
         for (game = 0; game < 100; game++) sim_game(&b, t);
     }
 
-    /* ---- the fairness test, at every level (Phase 4's level gets added here) ---- */
-    for (t = 0; t < 3; t++) {
+    /* ---- the fairness test, at every level ---- */
+    for (t = 0; t < 4; t++) {
         int partly = fairness(t, 1000);
         printf("fairness: level %d, %d positions with a ship partly hit\n", t, partly);
         CHECK(partly > 100, "fairness sweep reached partly hit ships");
@@ -359,6 +634,24 @@ int main(int argc, char **argv) {
         printf("sim: hard %.2f avg, random %.2f avg (2000 games each)\n",
                hard_total / 2000.0, rand_total / 2000.0);
         CHECK(rand_total - hard_total > 5500, "prob hunt clearly beats random hunt");
+    }
+
+    /* ---- ADMIRAL ---- */
+    admiral_checks();
+
+    /* strength: 2000 fleets at 500 tries a turn, the ROM's mean over the first 10 turns (its whole-
+       game mean is about 870, and more tries buy nothing measurable). The fleets are fixed, not
+       swept: the margin is small. Over 10 disjoint blocks of 2000 fleets ADMIRAL led in all 10, by
+       0.43 to 0.78 shots. */
+    {
+        int game, hard_total = 0, admiral_total = 0;
+        for (game = 0; game < 2000; game++) {
+            hard_total += solo_shots(&b, game, 2, 0);
+            admiral_total += solo_shots(&b, game, 3, 500);
+        }
+        printf("sim: admiral %.2f avg, hard %.2f avg (2000 fleets, 500 tries a turn)\n",
+               admiral_total / 2000.0, hard_total / 2000.0);
+        CHECK(admiral_total < hard_total, "ADMIRAL beats HARD on the same fleets");
     }
 
     printf("test_place: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);

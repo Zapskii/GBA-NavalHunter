@@ -114,6 +114,28 @@ def last_one_alive(e, name, also_fired):
     e.poke_board(name, own, st, hits, 1)
     return last
 
+def admiral_game(e, midshot=None):
+    """Lose a game to ADMIRAL by only shooting water. Every enemy shot is checked as it lands.
+    Returns (turn, samples, tries) per turn, or None if the game stalled."""
+    own_o = e.board("ob")[0]
+    rows, drops0 = [], e.u32("frame_drops")
+    for turn, i in enumerate(water(own_o), 1):
+        if not e.battle_ready(): return None
+        st0 = e.board("pb")[1]
+        e.shoot(i)
+        if not e.until(lambda: e.text("status_text") == "ENEMY TURN", 200): return None
+        e.poke(e.sym["worst_frame"], bytes(4))
+        if not e.until(lambda: e.board("pb")[1] != st0, THINK_FRAMES + 2): return None
+        e.run(2)                                # the frame that picks and fires has ended
+        st1, le = e.board("pb")[1], e.u8("last_enemy")
+        live = [c for c in range(100) if st0[c] == S_EMPTY and not any(st0[n] == S_SUNK for n in around(c))]
+        rows.append(dict(turn=turn, samples=e.u16("samples"), tries=e.u16("sample_tries"), think=e.u8("think_frames"),
+                         spent=st0[le] != S_EMPTY, water=bool(live) and le not in live, cost=e.u32("worst_frame")))
+        if midshot and turn == midshot[0]: e.shot(midshot[1])
+        if e.board("pb")[3] == 0: break
+    check(e.u32("frame_drops") == drops0, f"no frame dropped through it ({e.u32('frame_drops') - drops0})")
+    return rows
+
 def main():
     e = Emu("navalhunter.gba")
     e.run(10)
@@ -150,9 +172,12 @@ def main():
     check(q > 0, f"the ? of the menu's question is drawn ({q} pixels)")
     e.shot("2-menu")
     levels = [e.u8("ai_level")]
-    for _ in range(3):
+    for _ in range(4):
         e.tap(SELECT); levels.append(e.u8("ai_level"))
-    check(levels == [1, 2, 0, 1], f"SELECT cycles the level: {levels}")
+        if levels[-1] == 3:
+            e.run(2)
+            e.shot("2b-menu-admiral")
+    check(levels == [1, 2, 3, 0, 1], f"SELECT cycles four levels: {levels}")
     e.tap(START); e.tap(RIGHT); e.run(5)
     check(e.state() == ST_MENU, "START and the d-pad do not leave the menu")
 
@@ -407,6 +432,60 @@ def main():
     check(e.u32("frame_drops") == 0, f"no frame dropped through a HARD game ({e.u32('frame_drops')})")
     e.run(10)
     e.shot("13-win-hard")
+
+    # --- a whole game at ADMIRAL, lost on purpose so it fires until your whole fleet is gone
+    e.tap(START); e.run(5)
+    e.tap(SELECT)
+    check(e.u8("ai_level") == 3, "ADMIRAL")
+    check(enter_battle(e), "an ADMIRAL game")
+    e.run(60)                                   # let the boards paint in
+    e.poke(e.sym["ai_cycles"], bytes(4))        # HARD's stall is not ADMIRAL's
+    rows = admiral_game(e, (25, "13b-admiral-midgame"))
+    if rows is None:
+        check(False, f"a whole game at ADMIRAL plays through, each shot inside the pause ({e.u32('frame_drops')} frames dropped)")
+        return 1
+    check(e.wait_state(ST_END), "and ends")
+    e.run(10)
+    check(e.text("status_text") == "YOU LOSE" and e.board("pb")[3] == 0, f"ADMIRAL sank the fleet in {len(rows)} shots")
+    e.shot("13c-admiral-win")
+    check(all(r["think"] == THINK_FRAMES for r in rows), f"every shot took the {THINK_FRAMES}-frame pause: {sorted({r['think'] for r in rows})}")
+    check(not any(r["spent"] for r in rows), "it never fired at a spent cell")
+    check(not any(r["water"] for r in rows), "and never at known water")
+    def spread(what, rs):
+        s = [r["samples"] for r in rs]
+        print(f"     samples per turn, {what}: min {min(s)} mean {sum(s) / len(s):.0f} max {max(s)} ({len(s)} turns)")
+    spread("whole game", rows); spread("first 10", rows[:10]); spread("last 10", rows[-10:])
+    # the fallback is legal, and rare: 1 turn in about 3000 at the ROM's rate
+    check(sum(r["samples"] < 50 for r in rows) <= 2, f"sampling carried the game: {sum(r['samples'] < 50 for r in rows)} fallback turns")
+    cost = max(r["cost"] for r in rows)
+    print(f"     worst frame of an ADMIRAL turn: {cost} of {FRAME_CYCLES} cycles ({cost * 100 // FRAME_CYCLES}%)")
+    print(f"     mc_pick at most {e.u32('ai_cycles')} cycles")
+    check(cost < FRAME_CYCLES, "every sampling frame fits a frame")
+
+    # --- ADMIRAL with no valid fleet: the carrier exists nowhere (a tight manual layout can leave a
+    #     ship unplaced) and all water is fired, so the fallback must carry a whole game
+    e.tap(START); e.run(5)
+    for _ in range(4): e.tap(SELECT)
+    check(e.u8("ai_level") == 3, "ADMIRAL again")
+    check(enter_battle(e), "an ADMIRAL game with no valid fleet")
+    e.run(60)
+    own_p, st_p, hits_p, _ = e.board("pb")
+    own_p = bytearray(EMPTY if c == 0 else c for c in own_p)
+    st_p = bytearray(S_MISS if c == EMPTY else S_EMPTY for c in own_p)
+    bs = cells(own_p, 1)[1]
+    st_p[bs] = S_HIT
+    hits_p = bytearray(7); hits_p[1] = 1
+    e.poke_board("pb", own_p, st_p, hits_p, 6)
+    rows = admiral_game(e, (1, "13d-admiral-fallback"))
+    if rows is None:
+        check(False, "the fallback plays a whole game through, each shot inside the pause")
+        return 1
+    check(e.wait_state(ST_END), "and it ends")
+    check(all(r["samples"] < 50 for r in rows), f"sampling got too few fleets on every turn: {[r['samples'] for r in rows][:5]}")
+    print(f"     tries in that budget, first turn: {rows[0]['tries']}; worst frame {max(r['cost'] for r in rows)}; pick at most {e.u32('ai_cycles')} cycles")
+    check(all(r["think"] == THINK_FRAMES and not r["spent"] and not r["water"] for r in rows), "every fallback shot legal and on time")
+    check(max(r["cost"] for r in rows) < FRAME_CYCLES, "and within a frame")
+    e.run(10)
 
     # --- a loss, set up by poke, at EASY: only one cell left to fire at, and it is your last ship
     e.tap(START); e.run(5)

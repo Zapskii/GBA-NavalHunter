@@ -251,9 +251,8 @@ static uint8_t ai_hunt(const Board *b) {
    hold it; the cell covered by the most placements is the best next shot.
    A placement fits only if every hull cell is unfired and the whole hull
    respects the moat of every KNOWN ship cell (ships never touch).
-   # ponytail: per-ship counts ignore multi-ship mutual exclusion; the
-   # standard upgrade is iterative re-weighting, only if the sim shows misses
-   # in endgame parity with solvers. */
+   # ponytail: per-ship counts ignore multi-ship mutual exclusion. That is the
+   # strength HARD is meant to have; ADMIRAL below samples whole fleets instead. */
 static uint8_t ai_prob_pick(const Board *b) {
     uint16_t score[100];
     uint16_t bestv = 0;
@@ -305,16 +304,174 @@ static uint8_t ai_random(const Board *b) {
     return 0;
 }
 
+static uint8_t ai_admiral(const Board *b, uint16_t tries);
+
 /* Next shot: a queued follow-up if any, else the hunt the player picked:
    0 = EASY (random), 1 = NORMAL (moat-aware random), 2 = HARD (probability
-   map). The queued cell is consumed so it is not fired twice. */
+   map). The queued cell is consumed so it is not fired twice. 3 = ADMIRAL,
+   which ignores the queue; here it gets a fixed count of tries, so the same
+   seed gives the same shot. The ROM steps it against the clock instead. */
+#define MC_TRIES 128
 static uint8_t ai_next(const Board *b, uint8_t level) {
     uint8_t i;
+    if (level == 3) return ai_admiral(b, MC_TRIES);
     for (i = 0; i < 100; i++)
         if (target[i]) { target[i] = 0; return i; }
     return level == 0 ? ai_random(b)
          : level == 1 ? ai_hunt(b)
          :              ai_prob_pick(b);
+}
+
+/* ---------- ADMIRAL: sample whole fleets consistent with what is seen, fire where most hit ------
+   mc_begin once a turn, mc_step as often as time allows, then mc_pick. Reads st[] and which ships
+   are sunk, nothing else. Boards are one bitmask per row, so a sample costs little on an ARM7.
+   A sampled fleet obeys what a player knows: a live ship avoids fired water, sunk ships and their
+   moat; no hull touches another; every S_HIT is under a live ship; and no live ship is all hits,
+   or it would have sunk. Ships go through the hits first, or nearly every sample is rejected. */
+#define MC_MIN_SAMPLES 50       /* fewer valid fleets than this: use the honest queue and hunt */
+#define MC_SHIP_TRIES  24       /* placements to try per ship before giving the sample up */
+
+typedef struct { uint8_t x, y, horiz, s; } McShip;
+
+static uint16_t mc_score[100];
+static uint16_t mc_samples, mc_tries;
+static uint16_t mc_bad[10];     /* per row, the cells no live ship can use */
+static uint16_t mc_hits[10];    /* per row, the S_HIT cells */
+static McShip mc_fleet[NSHIP];  /* the latest try, as far as it got */
+static uint8_t mc_placed;
+
+static void mc_begin(const Board *b) {
+    int8_t x, y, dx, dy;
+    uint8_t i;
+    for (i = 0; i < 100; i++) mc_score[i] = 0;
+    for (i = 0; i < 10; i++) mc_bad[i] = mc_hits[i] = 0;
+    mc_samples = mc_tries = 0;
+    for (y = 0; y < 10; y++)
+        for (x = 0; x < 10; x++) {
+            uint8_t st = b->st[y * 10 + x];
+            if (st == S_HIT) mc_hits[y] |= (uint16_t)(1u << x);
+            if (st == S_MISS) mc_bad[y] |= (uint16_t)(1u << x);
+            if (st == S_SUNK)
+                for (dy = -1; dy <= 1; dy++)
+                    for (dx = -1; dx <= 1; dx++)
+                        if (y + dy >= 0 && y + dy <= 9 && x + dx >= 0 && x + dx <= 9)
+                            mc_bad[y + dy] |= (uint16_t)(1u << (x + dx));
+        }
+}
+
+/* Ship s at (x,y), if the rules let it go there: the caller keeps it on the board. It claims its
+   hull and moat in `used`, and takes the hits it covers out of `left`. */
+static uint8_t mc_put(uint16_t *used, uint16_t *left, uint8_t x, uint8_t y, uint8_t horiz, uint8_t s) {
+    uint8_t len = ship_len[s], rows = horiz ? 1 : len, r, top, end, unfired = 0;
+    uint16_t hull = (uint16_t)(horiz ? ((1u << len) - 1) << x : 1u << x);
+    uint16_t wide = (uint16_t)((hull | hull << 1 | hull >> 1) & 0x3FF);
+    for (r = y; r < y + rows; r++) {
+        if (used[r] & hull) return 0;
+        if (hull & ~mc_hits[r]) unfired = 1;
+    }
+    if (!unfired) return 0;
+    top = y ? y - 1 : 0;
+    end = y + rows < 10 ? y + rows : 9;
+    for (r = top; r <= end; r++)                /* a hit in the moat could never be covered */
+        if (mc_hits[r] & wide & ~(r >= y && r < y + rows ? hull : 0)) return 0;
+    for (r = top; r <= end; r++) used[r] |= wide;
+    for (r = y; r < y + rows; r++) left[r] &= (uint16_t)~hull;
+    mc_fleet[mc_placed].x = x; mc_fleet[mc_placed].y = y;
+    mc_fleet[mc_placed].horiz = horiz; mc_fleet[mc_placed].s = s;
+    mc_placed++;
+    return 1;
+}
+
+/* A number below n from 10 random bits at `shift` of r. No division: an ARM7 has none. */
+#define MC_BELOW(r, shift, n) ((uint8_t)((((r) >> (shift) & 0x3FF) * (uint32_t)(n)) >> 10))
+
+/* Try one fleet. Returns 1 if it was valid, and scores its unfired cells. */
+static uint8_t mc_step(const Board *b) {
+    uint16_t used[10], left[10];
+    uint8_t todo = 0, s, r, k, i;               /* todo: live ships not yet placed, as a bit each */
+    mc_tries++;
+    mc_placed = 0;
+    for (r = 0; r < 10; r++) { used[r] = mc_bad[r]; left[r] = mc_hits[r]; }
+    for (s = 0; s < NSHIP; s++)
+        if (b->hits[s] < ship_len[s]) todo |= (uint8_t)(1u << s);
+
+    /* Each uncovered hit gets a ship through it. A cell has one placement per unit of length on
+       each axis, so picking a unit of length at random makes every placement equally likely. */
+    for (r = 0; r < 10; r++)
+        while (left[r]) {
+            uint8_t hx = 0, sum = 0;
+            if (!todo) return 0;                /* more hits than ships can cover */
+            while (!(left[r] >> hx & 1)) hx++;
+            for (s = 0; s < NSHIP; s++) if (todo >> s & 1) sum += ship_len[s];
+            for (k = 0; k < MC_SHIP_TRIES; k++) {
+                uint32_t rnd = sim_rand();
+                uint8_t pick = MC_BELOW(rnd, 0, sum), horiz = (uint8_t)(rnd >> 10 & 1), len;
+                int8_t x = (int8_t)hx, y = (int8_t)r;
+                for (s = 0; ; s++) {
+                    if (!(todo >> s & 1)) continue;
+                    if (pick < ship_len[s]) break;
+                    pick -= ship_len[s];
+                }
+                len = ship_len[s];
+                if (horiz) x -= (int8_t)pick; else y -= (int8_t)pick;
+                if (x < 0 || y < 0 || (horiz ? x + len : y + len) > 10) continue;
+                if (mc_put(used, left, (uint8_t)x, (uint8_t)y, horiz, s)) { todo &= (uint8_t)~(1u << s); break; }
+            }
+            if (k == MC_SHIP_TRIES) return 0;
+        }
+
+    /* The rest go anywhere legal, longest first as the fleet is dealt. */
+    for (s = 0; s < NSHIP; s++) {
+        uint8_t len = ship_len[s];
+        if (!(todo >> s & 1)) continue;
+        for (k = 0; k < MC_SHIP_TRIES; k++) {
+            uint32_t rnd = sim_rand();
+            uint8_t horiz = (uint8_t)(rnd >> 20 & 1);
+            uint8_t x = MC_BELOW(rnd, 0, horiz ? 11 - len : 10), y = MC_BELOW(rnd, 10, horiz ? 10 : 11 - len);
+            if (mc_put(used, left, x, y, horiz, s)) break;
+        }
+        if (k == MC_SHIP_TRIES) return 0;
+    }
+
+    for (i = 0; i < mc_placed; i++) {
+        const McShip *f = &mc_fleet[i];
+        uint8_t at = (uint8_t)(f->y * 10 + f->x), step = f->horiz ? 1 : 10;
+        for (k = 0; k < ship_len[f->s]; k++, at = (uint8_t)(at + step))
+            if (b->st[at] == S_EMPTY) mc_score[at]++;
+    }
+    mc_samples++;
+    return 1;
+}
+
+/* Rebuilt rather than trusted: a sinking clears the whole queue, and at this level another ship
+   can be partly hit by then, which at the other levels it cannot. */
+static void ai_requeue(const Board *b) {
+    uint8_t i;
+    ai_clear_queue();
+    for (i = 0; i < 100; i++)
+        if (b->st[i] == S_HIT) ai_hit(b, (uint8_t)(i % 10), (uint8_t)(i / 10));
+}
+
+/* The most sampled unfired cell, random among ties. Too few samples, and the honest queue and
+   NORMAL's hunt take the shot: HARD's map costs too many frames to run here. */
+static uint8_t mc_pick(const Board *b) {
+    if (mc_samples >= MC_MIN_SAMPLES) {
+        uint8_t start = (uint8_t)(sim_rand() % 100), i, best = 0;
+        uint16_t bestv = 0;
+        for (i = 0; i < 100; i++) {
+            uint8_t idx = (uint8_t)((start + i) % 100);
+            if (b->st[idx] == S_EMPTY && mc_score[idx] > bestv) { bestv = mc_score[idx]; best = idx; }
+        }
+        if (bestv) { target[best] = 0; return best; }
+    }
+    ai_requeue(b);
+    return ai_next(b, 1);
+}
+
+static uint8_t ai_admiral(const Board *b, uint16_t tries) {
+    mc_begin(b);
+    while (tries--) mc_step(b);
+    return mc_pick(b);
 }
 
 #endif /* PLACE_H */
