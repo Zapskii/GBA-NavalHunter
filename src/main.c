@@ -31,10 +31,26 @@ enum { VIEW_HIDDEN, VIEW_SHIPS, VIEW_END };     /* what a board shows of its fle
 #define SPLASH_FRAMES 300       /* the win or lose art's hold, as on GB: 5 seconds */
 #define SPLASH_LOCK 36          /* no skipping until the jingle is over, so mashing the last shot's A cannot */
 #define THINK_FRAMES 30         /* the enemy's pause; the AI runs inside it */
+#define SEA_RATE 8              /* frames per step of the sea's 16: a wave passes in about 2 seconds */
+#define SHELL_FRAMES 24         /* a shell's flight */
+#define IMPACT_RATE 4           /* frames per frame of splash or blast art */
+#define SINK_STAGGER 3          /* frames between a sinking ship's blasts, one per hull cell */
+#define AFTER_SHOT 6            /* a beat after the impact */
+#define FLASH_FRAMES 8
+#define SHAKE_FRAMES 16
+/* Fixed points, so a shell's start says nothing: your shells rise from your board, theirs from theirs. */
+#define YOUR_GUN_X 184
+#define YOUR_GUN_Y 52
+#define THEIR_GUN_X 72
+#define THEIR_GUN_Y 82
 #define ADMIRAL 3
-/* ADMIRAL samples until this scanline, which leaves the frame's own work 80 lines: the idle board
-   scan's 56 lines (68,950 cycles) and the longest mc_step that may just have started. */
-#define MC_STOP_LINE 80
+/* ADMIRAL samples until this scanline, which leaves the frame's own work 72 lines: the idle board scan's
+   22 lines and the longest mc_step that may just have started. Moved from 80 to win back what the
+   animation list (8 lines at the top of every frame) took from the samples. */
+#define MC_STOP_LINE 88
+/* Of a frame's 280,896 cycles: when a board stops and carries on in the next. It leaves room for the
+   scan of up to 100 cells that can follow the last cell drawn, about 14,000, and one more cell. */
+#define PAINT_LATEST 248000
 #define REPEAT_DELAY 18         /* the GB's key repeat: ~0.30 s before it kicks in */
 #define REPEAT_RATE   9         /* then ~6.7 moves a second */
 
@@ -52,6 +68,7 @@ typedef struct {
        only grow when a ship sinks, and look() checks a fired cell first. */
     u8 moat[100];
     u8 moat_alive;              /* b->alive when moat was built */
+    u8 moat_next;               /* how far a rebuild has got */
 } Pane;
 
 /* Read by tools/e2e.py through the .sym file, so not static. */
@@ -71,13 +88,47 @@ u8 last_enemy;
 u16 shots_fired, shots_hit;
 char status_text[24], msg_text[24];
 
-static Pane big = { BIG_X, BIG_Y, 12, NULL, VIEW_HIDDEN, {0}, {0}, 0xFF };
-static Pane mini = { SMALL_X, SMALL_Y, 8, NULL, VIEW_SHIPS, {0}, {0}, 0xFF };
+static Pane big = { BIG_X, BIG_Y, 12, NULL, VIEW_HIDDEN, {0}, {0}, 0xFF, 0 };
+static Pane mini = { SMALL_X, SMALL_Y, 8, NULL, VIEW_SHIPS, {0}, {0}, 0xFF, 0 };
 static u8 preview_len, preview_legal;   /* the ship in hand during placement; 0 = none */
-static OBJ_ATTR obuf[2];                /* 0 the aiming cursor, 1 the enemy's last shot */
-static volatile u8 work_done = 1, thinking;
+/* The sprites: 0 the aiming cursor, 1 the enemy's last shot, then one per entry of anim[], then smoke.
+   A shell's flight scales through affine matrix 0. An impact uses matrix 1 on the small board, which
+   shrinks it, and matrix 2, the identity, on the big one.
+   At most 18 damaged cells a board, so 46 of the 128 are ever used. */
+#define ANIMS 8
+#define OBJ_ANIM 2
+#define OBJ_SMOKE_AT (OBJ_ANIM + ANIMS)
+#define SMOKE_MAX 36
+#define OBJ_USED (OBJ_SMOKE_AT + SMOKE_MAX)
+#define OBJ_ART (512 + 8)       /* where art_obj sits: after make_box's two boxes */
+static OBJ_ATTR obuf[OBJ_USED];
+enum { A_NONE, A_SHELL, A_SPLASH, A_BLAST, A_FLASH, A_SHAKE, A_WAIT };
+/* What animates. Nothing here reads own[] of an unsunk ship or calls sim_rand, and the shot it shows
+   was resolved before it started, so it can't change an outcome. t < 0: still waiting to start. */
+typedef struct { u8 kind, small; s16 t, len, x, y, x0, y0; } Anim;
+Anim anim[ANIMS];
+u8 smoke_n;                     /* damaged cells on show */
+u8 smoke_at[SMOKE_MAX];         /* each one's cell, plus 100 on your board */
+static u8 smoke_x[SMOKE_MAX], smoke_y[SMOKE_MAX];
+static s8 shake_x, shake_y;
+static const Pane *held_pane;   /* a shell is on its way here: the board shows the shot when it lands */
+u8 sea_rate = SEA_RATE;         /* a knob, and tools/e2e.py stops the sea with it to compare whole screens */
+u8 sea_phase;
+static u8 sea_tick;
+volatile u8 shaking;            /* the backdrop shows at the picture's edge, so it takes the chrome's colour */
+static volatile u8 work_done = 1;
+static u32 ai_chunk;            /* where the current slice of the AI's work began */
 static u8 held_btn, held_timer;
 static u32 frame_start;
+
+/* Timers 2 and 3 cascaded: a free-running 32-bit count of CPU cycles. Low half read between two
+   reads of the high half, or a carry between the reads puts it 65,536 out. */
+static u32 cycles(void)
+{
+    u32 hi, lo;
+    do { hi = REG_TM3D; lo = REG_TM2D; } while (hi != REG_TM3D);
+    return hi << 16 | lo;
+}
 
 /* ---------------------------------------------------------------- the boards */
 static u8 look(const Pane *p, int i)
@@ -104,10 +155,16 @@ static void draw_cell(const Pane *p, int i, int t)
 static void sync_pane(Pane *p)
 {
     int i;
+    /* All by the clock, not REG_VCOUNT: a frame's work starts in VBlank, so a line number can't tell
+       its start from an overrun. What doesn't fit carries on in the next frame. */
+    if (cycles() - frame_start > PAINT_LATEST) return;
     if (p->b && p->b->alive != p->moat_alive) {
-        /* About 80 scanlines. Start only if they fit before VBlank, else carry on next frame. */
-        if (REG_VCOUNT >= 60 && REG_VCOUNT < 160) return;
-        for (i = 0; i < 100; i++) p->moat[i] = is_known_water(p->b, i % 10, i / 10);
+        /* Most of 100 scanlines, on top of whatever the frame has drawn already. */
+        for (; p->moat_next < 100; p->moat_next++) {
+            if (cycles() - frame_start > PAINT_LATEST) return;
+            p->moat[p->moat_next] = is_known_water(p->b, p->moat_next % 10, p->moat_next / 10);
+        }
+        p->moat_next = 0;
         p->moat_alive = p->b->alive;
     }
     for (i = 0; p->b && i < 100; i++) {
@@ -119,9 +176,8 @@ static void sync_pane(Pane *p)
                 want = (preview_legal ? T_HULL : T_BAD) + gfx_seg_of(place_horiz ? dx : dy, preview_len, place_horiz);
         }
         if (want == p->shown[i]) continue;
-        /* A whole board does not fit in a frame. Stop near the end of this one and carry on
-           in the next: a cell costs a few scanlines at most. */
-        if (REG_VCOUNT >= 140 && REG_VCOUNT < 160) return;
+        /* A whole board does not fit in a frame. A cell costs a few scanlines at most. */
+        if (cycles() - frame_start > PAINT_LATEST) return;
         draw_cell(p, i, want);
         p->shown[i] = want;
     }
@@ -129,25 +185,144 @@ static void sync_pane(Pane *p)
 
 static void sync_boards(void)
 {
-    sync_pane(&big);
-    sync_pane(&mini);
+    if (held_pane != &big) sync_pane(&big);
+    if (held_pane != &mini) sync_pane(&mini);
 }
 
 /* ---------------------------------------------------------------- frame */
 static void on_vbl(void)
 {
+    int k;
     frames++;
-    if (!work_done && !thinking) frame_drops++;  /* this VBlank came before the frame's work ended */
+    if (!work_done) frame_drops++;  /* this VBlank came before the frame's work ended */
     work_done = 0;
+    /* Only palette entries 0-15, which only water uses, and only here. A fade or a flash is brightness
+       and art_load is 64 up, so nothing else touches them. Minus, so the crests roll towards you. */
+    if (sea_rate && ++sea_tick >= sea_rate) { sea_tick = 0; sea_phase--; }
+    for (k = 0; k < 16; k++) pal_bg_mem[k] = art_shared_pal[(k + sea_phase) & 15];
+    /* ponytail: index 0 is also the backdrop, so one step of water goes dark for the length of a shake.
+       Remap the sea off index 0 if it ever shows. */
+    if (shaking) pal_bg_mem[0] = art_shared_pal[C_BG];
 }
 
-/* Timers 2 and 3 cascaded: a free-running 32-bit count of CPU cycles. Low half read between two
-   reads of the high half, or a carry between the reads puts it 65,536 out. */
-static u32 cycles(void)
+/* ---------------------------------------------------------------- animation */
+static void wait_frame(void);
+
+/* Which cells smoke: S_HIT cells, read from st[] alone. The position and the loop's phase come from the
+   cell's number, so no sprite can give away a ship's axis or an unhit cell. */
+static void smoke_scan(void)
 {
-    u32 hi, lo;
-    do { hi = REG_TM3D; lo = REG_TM2D; } while (hi != REG_TM3D);
-    return hi << 16 | lo;
+    const Pane *const panes[2] = { &big, &mini };
+    int n = 0, q, i;
+    for (q = 0; q < 2; q++) {
+        const Pane *p = panes[q];
+        if (!p->b || p->view == VIEW_END) continue;
+        for (i = 0; i < 100 && n < SMOKE_MAX; i++)
+            if (p->b->st[i] == S_HIT) {
+                smoke_at[n] = i + 100 * q;
+                smoke_x[n] = p->x + i % 10 * p->size + (p->size - 8) / 2 + 1;
+                smoke_y[n] = p->y + i / 10 * p->size + (p->size - 8) / 2;
+                n++;
+            }
+    }
+    smoke_n = n;
+}
+
+static void anim_sprite(OBJ_ATTR *o, int cx, int cy, int matrix, int tile)
+{
+    obj_set_attr(o, ATTR0_SQUARE | ATTR0_AFF | ATTR0_Y(cy - 8 - shake_y),
+                 ATTR1_SIZE_16 | ATTR1_AFF_ID(matrix) | ATTR1_X(cx - 8 - shake_x), ATTR2_ID(OBJ_ART + tile));
+}
+
+/* Shell: along a straight line, lifted into an arc, biggest at the top so it falls towards the sea. */
+static void shell_step(const Anim *a, OBJ_ATTR *o)
+{
+    int hump = 4 * a->t * (a->len - a->t), span = a->len * a->len;
+    int scale = 150 + hump * 280 / span;        /* 256 is the art's own size */
+    OBJ_AFFINE *m = (OBJ_AFFINE *)obuf;
+    m->pa = m->pd = (1 << 16) / scale;
+    m->pb = m->pc = 0;
+    anim_sprite(o, a->x0 + (a->x - a->x0) * a->t / a->len,
+                a->y0 + (a->y - a->y0) * a->t / a->len - 40 * hump / span, 0, OBJ_SHELL);
+}
+
+static void shake_stop(void)
+{
+    shaking = shake_x = shake_y = 0;
+    REG_BG2X = REG_BG2Y = 0;
+}
+
+/* From wait_frame, at the top of VBlank: registers change between pictures, and OAM is copied next. */
+static void anim_step(void)
+{
+    int k;
+    for (k = 0; k < ANIMS; k++) {
+        Anim *a = &anim[k];
+        OBJ_ATTR *o = &obuf[OBJ_ANIM + k];
+        obj_hide(o);
+        if (!a->kind || ++a->t < 0) continue;
+        if (a->t >= a->len) {
+            if (a->kind == A_FLASH) REG_BLDY = 0;
+            if (a->kind == A_SHAKE) shake_stop();
+            a->kind = A_NONE;
+            continue;
+        }
+        switch (a->kind) {
+        case A_SHELL: shell_step(a, o); break;
+        case A_SPLASH: anim_sprite(o, a->x, a->y, a->small ? 1 : 2, OBJ_SPLASH + 4 * (a->t / IMPACT_RATE)); break;
+        case A_BLAST: anim_sprite(o, a->x, a->y, a->small ? 1 : 2, OBJ_BLAST + 4 * (a->t / IMPACT_RATE)); break;
+        case A_FLASH: REG_BLDY = a->x * (a->len - a->t) / a->len; break;
+        case A_SHAKE: {
+            int amp = 1 + 2 * (a->len - a->t) / a->len;
+            shake_x = a->t & 2 ? amp : -amp;
+            shake_y = (a->t + 1) & 2 ? amp : -amp;
+            REG_BG2X = shake_x << 8;
+            REG_BG2Y = shake_y << 8;
+            break;
+        }
+        }
+    }
+    if (!held_pane && !(frames & 7)) smoke_scan();
+    for (k = 0; k < SMOKE_MAX; k++) {
+        OBJ_ATTR *o = &obuf[OBJ_SMOKE_AT + k];
+        if (k >= smoke_n) { obj_hide(o); continue; }
+        obj_set_attr(o, ATTR0_SQUARE | ATTR0_Y(smoke_y[k] - shake_y), ATTR1_SIZE_8 | ATTR1_X(smoke_x[k] - shake_x),
+                     ATTR2_ID(OBJ_ART + OBJ_SMOKE + ((frames >> 3) + smoke_at[k] * 3) % OBJ_SMOKE_N));
+    }
+}
+
+static void anim_add(int kind, int delay, int len, int x, int y, int small)
+{
+    int k;
+    for (k = 0; k < ANIMS; k++)
+        if (!anim[k].kind) {
+            Anim a = { (u8)kind, (u8)small, (s16)(-delay - 1), (s16)len, (s16)x, (s16)y, 0, 0 };
+            anim[k] = a;
+            if (kind == A_SHAKE) shaking = 1;
+            return;
+        }
+}
+
+/* Everything to its end at once. Called only straight after wait_frame, so still in VBlank. */
+static void anim_finish(void)
+{
+    int k;
+    for (k = 0; k < ANIMS; k++) anim[k].kind = A_NONE;
+    REG_BLDY = 0;
+    shake_stop();
+}
+
+/* The one wait with a way out: a fresh A or B ends the list. key_hit is an edge, so that press is used
+   up here and can't fire the next shot, and a button held down never skips anything. 1 if skipped. */
+static int anim_run(void)
+{
+    int k;
+    for (;;) {
+        for (k = 0; k < ANIMS && !anim[k].kind; k++) ;
+        if (k == ANIMS) return 0;
+        wait_frame();
+        if (key_hit(KEY_A | KEY_B)) { anim_finish(); return 1; }
+    }
 }
 
 /* The one place the game waits. */
@@ -160,7 +335,8 @@ static void wait_frame(void)
     work_done = 1;
     VBlankIntrWait();
     frame_start = cycles();
-    oam_copy(oam_mem, obuf, 2);
+    anim_step();
+    oam_copy(oam_mem, obuf, OBJ_USED);
     key_poll();
 }
 
@@ -209,7 +385,7 @@ static void fade(int out)
         REG_BLDY = out ? 2 * k : 16 - 2 * k;
     }
     wait_frame();
-    if (!out) REG_BLDCNT = BLD_TOP_MASK | BLD_WHITE;    /* flash_hit's setting */
+    if (!out) REG_BLDCNT = BLD_TOP_MASK | BLD_WHITE;    /* A_FLASH's setting */
 }
 
 /* A full screen: its palette above the shared range, and its picture. Keep it under black or
@@ -232,6 +408,7 @@ static void pane_grid(Pane *p, int view)
     }
     p->view = view;
     p->moat_alive = 0xFF;
+    p->moat_next = 0;
     memset(p->shown, UNDRAWN, sizeof p->shown);
 }
 
@@ -283,13 +460,6 @@ static void sound_tick(void)
 
 static const u16 jingle_win[4] = { 1797, 1849, 1881, 1922 };    /* C5 E5 G5 C6 */
 static const u16 jingle_lose[4] = { 1797, 1713, 1650, 1546 };   /* C5 G4 E4 C4 */
-
-static void flash_hit(void)
-{
-    REG_BLDY = 8;
-    pause_frames(8);
-    REG_BLDY = 0;
-}
 
 /* ---------------------------------------------------------------- input */
 /* The direction to step this frame: at once on a press, then the GB's repeat. */
@@ -421,7 +591,7 @@ static void cursor_show(void)
     obj_unhide(&obuf[0], 0);
 }
 
-/* Message, sound and flash for one resolved shot. who is "" for yours, "YOUR " for theirs. */
+/* Message and sound for one resolved shot. who is "" for yours, "YOUR " for theirs. */
 static void shot_result(int r, int sunk, const char *who, const char *miss, const char *hit)
 {
     char b[24];
@@ -433,7 +603,44 @@ static void shot_result(int r, int sunk, const char *who, const char *miss, cons
         msg(strcat(b, " SUNK"));
         sound_explosion(1);
     }
-    flash_hit();
+}
+
+/* Show a shot the rules have already resolved: the shell flies with the board held back, then it lands
+   and the board, message and sound change together, then the impact plays. A or B skips what is left. */
+static void shot_show(Pane *p, int i, int r, int sunk, int from_x, int from_y, const char *who, const char *miss, const char *hit)
+{
+    int half = p->size / 2, x = p->x + i % 10 * p->size + half, y = p->y + i / 10 * p->size + half, small = p == &mini;
+    int len = OBJ_SPLASH_N * IMPACT_RATE, skipped, k, n = 0;
+    held_pane = p;
+    anim_add(A_SHELL, 0, SHELL_FRAMES, x, y, 0);
+    anim[0].x0 = from_x;        /* the list is empty between shots, so the shell is entry 0 */
+    anim[0].y0 = from_y;
+    skipped = anim_run();
+    held_pane = NULL;
+    smoke_scan();
+    if (small) {
+        obj_set_pos(&obuf[1], SMALL_X + 8 * (i % 10), SMALL_Y + 8 * (i / 10));
+        obj_unhide(&obuf[1], 0);
+    } else if (r == 2) panel_line(&ob, sunk);
+    shot_result(r, sunk, who, miss, hit);
+    if (skipped) return;
+    if (r == 0) anim_add(A_SPLASH, 0, len, x, y, small);
+    else {
+        len = OBJ_BLAST_N * IMPACT_RATE;
+        if (r == 1) {
+            anim_add(A_BLAST, 0, len, x, y, small);
+            anim_add(A_FLASH, 0, FLASH_FRAMES, 8, 0, 0);
+        } else {
+            for (k = 0; k < 100; k++)
+                if (p->b->own[k] == sunk)
+                    anim_add(A_BLAST, SINK_STAGGER * n++, len, p->x + k % 10 * p->size + half, p->y + k / 10 * p->size + half, small);
+            len += SINK_STAGGER * (n - 1);
+            anim_add(A_FLASH, 0, FLASH_FRAMES + 4, 12, 0, 0);
+            anim_add(A_SHAKE, 0, SHAKE_FRAMES, 0, 0, 0);
+        }
+    }
+    anim_add(A_WAIT, 0, len + AFTER_SHOT, 0, 0, 0);
+    anim_run();
 }
 
 /* ADMIRAL samples through the whole pause, a frame's worth at a time, so the frame loop keeps
@@ -457,19 +664,27 @@ static int admiral_think(void)
     return i;
 }
 
-/* ai_next at HARD takes several frames in Thumb from ROM (tools/e2e.py measures it and fails
-   if it outgrows the pause). It runs inside the enemy's pause, where nothing on screen is
-   moving, so it does not count as a dropped frame. The VBlank IRQ still runs throughout. */
+static void ai_chunk_end(void)
+{
+    u32 c = cycles() - ai_chunk;
+    if (c > ai_cycles) ai_cycles = c;
+}
+
+/* ai_between: HARD's map takes more than a frame, so it takes a frame between ships. */
+static void ai_yield(void)
+{
+    ai_chunk_end();
+    wait_frame();
+    ai_chunk = cycles();
+}
+
 static int enemy_think(void)
 {
-    u32 t0 = frames, c = cycles();
+    u32 t0 = frames;
     int i;
-    thinking = 1;
+    ai_chunk = cycles();
     i = ai_next(&pb, ai_level);
-    c = cycles() - c;
-    if (c > ai_cycles) ai_cycles = c;
-    wait_frame();
-    thinking = 0;
+    ai_chunk_end();
     while (frames - t0 < THINK_FRAMES) wait_frame();
     think_frames = frames - t0;
     return i;
@@ -480,7 +695,6 @@ static void enemy_turn(void)
     int i, x, y, r;
     u8 sunk = 0;
     status("ENEMY TURN");
-    obj_hide(&obuf[0]);
     i = ai_level == ADMIRAL ? admiral_think() : enemy_think();
     x = i % 10; y = i / 10;
     r = fire(&pb, x, y, &sunk);
@@ -493,9 +707,7 @@ static void enemy_turn(void)
     if (r == 1) ai_hit(&pb, x, y);
     if (r == 2) ai_clear_queue();
     last_enemy = y * 10 + x;
-    obj_set_pos(&obuf[1], SMALL_X + 8 * x, SMALL_Y + 8 * y);
-    obj_unhide(&obuf[1], 0);
-    shot_result(r, sunk, "YOUR ", "ENEMY MISS", "ENEMY HIT!");
+    shot_show(&mini, y * 10 + x, r, sunk, THEIR_GUN_X, THEIR_GUN_Y, "YOUR ", "ENEMY MISS", "ENEMY HIT!");
 }
 
 /* Both boards and the fleet list. A piece a frame, and then the boards paint in. */
@@ -556,18 +768,17 @@ static int battle(void)
         state = ST_ENEMY;
         shots_fired++;
         if (r) shots_hit++;
-        if (r == 2) panel_line(&ob, sunk);
-        shot_result(r, sunk, "", "MISS", "HIT!");
+        obj_hide(&obuf[0]);     /* no cursor while shells fly */
+        msg("");
+        shot_show(&big, cy * 10 + cx, r, sunk, YOUR_GUN_X, YOUR_GUN_Y, "", "MISS", "HIT!");
         if (ob.alive == 0) return 1;
-        pause_frames(45);
 
         enemy_turn();
         if (pb.alive == 0) return 0;
-        pause_frames(45);
 
+        /* The enemy's result stays up while you aim; your next shot clears it. */
         state = ST_BATTLE;
         status("YOUR TURN");
-        msg("");
     }
 }
 
@@ -590,6 +801,7 @@ static void splash(int won)
     obj_hide(&obuf[1]);
     fade(1);
     art_load(won ? art_win_pal : art_lose_pal, won ? art_win : art_lose);
+    smoke_scan();
     fade(0);
     state = ST_SPLASH;
     REG_SND1SWEEP = 0;
@@ -639,10 +851,13 @@ int main(void)
 {
     REG_WAITCNT = WS_STANDARD;
     oam_init(oam_mem, 128);
-    oam_init(obuf, 2);
+    oam_init(obuf, OBJ_USED);
+    /* the small board's impacts: 16 pixels of art to 12 */
+    ((OBJ_AFFINE *)obuf)[1].pa = ((OBJ_AFFINE *)obuf)[1].pd = 341;
+    ((OBJ_AFFINE *)obuf)[2].pa = ((OBJ_AFFINE *)obuf)[2].pd = 256;
     memcpy16(pal_bg_mem, art_shared_pal, ART_PAL_FIRST);
-    pal_obj_mem[1] = RGB15(31, 31, 4);
-    pal_obj_mem[2] = RGB15(31, 31, 31);
+    memcpy16(pal_obj_mem, art_obj_pal, 16);
+    memcpy16(&tile_mem[5][OBJ_ART - 512], art_obj, OBJ_TILES * 16);
     /* Mode 4 keeps sprite tiles from index 512: lower ones are hidden by the bitmap. */
     make_box(&tile_mem[5][0], 2, 13, 1);
     make_box(&tile_mem[5][4], 1, 8, 2);
@@ -652,6 +867,7 @@ int main(void)
     REG_TM3CNT = TM_CASCADE | TM_ENABLE;
     REG_TM2CNT = TM_ENABLE;
     REG_BLDCNT = BLD_TOP_MASK | BLD_WHITE;      /* every layer and the backdrop towards white */
+    ai_between = ai_yield;
     sound_init();
     gfx_fb = (volatile u16 *)MEM_VRAM;
     art_load(art_title_pal, art_title);

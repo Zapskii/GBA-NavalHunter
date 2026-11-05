@@ -13,6 +13,9 @@ PALETTE PLAN (BG palette, 256 entries)
             screen is black. Nothing else draws with them.
 A full screen may also use 0-63: its water is the same sea, and a colour already in SHARED costs
 no slot.
+
+OBJ PALETTE (16 entries, 4bpp sprites): see OBJ_PAL below. Sprites never use the BG palette, so nothing
+on a sprite cycles with the sea.
 """
 import math, os
 from PIL import Image, ImageDraw
@@ -334,6 +337,88 @@ def icon(n, sunk):
             else:
                 for e in range(3): g[2 + d][x0 + e] = pip
     return g
+
+# ---------------------------------------------------------------- the sprites
+# Index 0 is see-through. 1 and 2 are the aiming cursor and the enemy-shot marker, which main.c draws.
+OBJ_PAL = [(0, 0, 0), (255, 255, 32), (255, 255, 255),
+           (32, 36, 56), (96, 112, 128), (192, 204, 208),                   # 3-5 the shell, dark to light
+           (255, 255, 216), (255, 216, 48), (248, 128, 24), (208, 40, 24),  # 6-9 fire, hot to cold
+           (168, 168, 176), (112, 112, 124), (64, 64, 76),                  # 10-12 smoke, light to dark
+           (232, 248, 255), (152, 208, 232), (72, 136, 192)]                # 13-15 spray, light to dark
+SHELL_D, SHELL_M, SHELL_L = 3, 4, 5
+HOT, YEL, ORG, RED = 6, 7, 8, 9
+SMK_L, SMK_M, SMK_D = 10, 11, 12
+FOAM, PALE, BLUE = 13, 14, 15
+
+def polar(n):
+    """Every pixel of an n x n sprite, as x, y, distance from the centre and angle."""
+    c = (n - 1) / 2
+    for y in range(n):
+        for x in range(n):
+            yield x, y, math.hypot(x - c, y - c), math.atan2(y - c, x - c)
+
+def obj_shell():
+    """A round shot seen from above, lit from the top left. It has room to scale up inside 16 x 16."""
+    g = [[0] * 16 for _ in range(16)]
+    for x, y, d, _ in polar(16):
+        if d <= 4.3: g[y][x] = SHELL_D if d > 3.3 else SHELL_M
+        if math.hypot(x - 6, y - 6) <= 1.3: g[y][x] = SHELL_L
+    return g
+
+def obj_splash(k):
+    """A ring of foam spreading and breaking up, round a column of water that falls back."""
+    ring, col = (2.5, 4.5, 6, 7)[k], (1.5, 2.5, 1.5, 0)[k]
+    gaps = (99, 12, 8, 6)[k]        # how many pieces the ring breaks into
+    c = (FOAM, FOAM, PALE, BLUE)[k]
+    g = [[0] * 16 for _ in range(16)]
+    for x, y, d, a in polar(16):
+        if abs(d - ring) <= 0.7 and (k == 0 or math.cos(a * gaps) > -0.3): g[y][x] = c
+        if d <= col: g[y][x] = FOAM if d <= col - 1 else PALE
+    return g
+
+def obj_blast(k):
+    """A spiked fireball swelling, then burning out into smoke with holes in it."""
+    r = (3, 5.5, 7, 7.5, 7.5)[k]
+    g = [[0] * 16 for _ in range(16)]
+    for x, y, d, a in polar(16):
+        edge = r * (0.8 + 0.2 * math.cos(7 * a + k * 2))
+        if d > edge: continue
+        t = d / edge
+        if k < 3: c = HOT if t < 0.35 else YEL if t < 0.6 else ORG if t < 0.85 else RED
+        elif k == 3: c = 0 if t < 0.3 and (x + y) & 1 else RED if t < 0.5 else ORG if t < 0.7 else SMK_D
+        else: c = (SMK_D if t > 0.6 else SMK_M) if (x + y) & 1 and t > 0.35 else 0
+        g[y][x] = c
+    return g
+
+def obj_smoke(k):
+    """Four looping frames, 8 x 8: a lick of flame low down, and puffs rising off it. Small, with the
+    cell's mark still showing round it."""
+    g = [[0] * 8 for _ in range(8)]
+    def blob(cx, cy, r, c):
+        for y in range(8):
+            for x in range(8):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= r * r: g[y][x] = c
+    for off, c, r in ((0, SMK_L, 1.5), (3, SMK_M, 2.0), (6, SMK_D, 1.5)):
+        h = (k * 2 + off) % 8                   # height over the flame; a whole loop rises 8
+        if h < 6: blob(3 + (1 if h in (2, 3) else 0) - (1 if h > 4 else 0), 5 - h, r if h > 1 else 1.0, c)
+    g[6][3] = g[7][3] = ORG
+    g[6][3 + (k & 1)] = YEL
+    g[5 + (k >> 1 & 1)][3 - (k & 1)] = RED
+    return g
+
+def obj_tiles(g):
+    """A sprite to 4bpp tiles, in 1D order: left to right, then down."""
+    out = bytearray()
+    n = len(g)
+    for ty in range(0, n, 8):
+        for tx in range(0, n, 8):
+            for y in range(8):
+                for x in range(0, 8, 2):
+                    out.append(g[ty + y][tx + x] | g[ty + y][tx + x + 1] << 4)
+    return bytes(out)
+
+OBJ_FRAMES = [("OBJ_SHELL", [obj_shell()]), ("OBJ_SPLASH", [obj_splash(k) for k in range(4)]),
+              ("OBJ_BLAST", [obj_blast(k) for k in range(5)]), ("OBJ_SMOKE", [obj_smoke(k) for k in range(4)])]
 
 # ---------------------------------------------------------------- pixel canvas helpers
 SEA_KEY = lambda k: (1, 2, k)                  # not a multiple of 8, so no painted colour can equal it
@@ -820,6 +905,14 @@ def main():
     h += ["extern const uint16_t art_shared_pal[ART_PAL_FIRST];"]
     for n in screens:
         h += [f"extern const uint16_t art_{n}_pal[ART_PAL_N];", f"extern const uint8_t art_{n}[{W * H}];"]
+    obj_data, obj_enum = bytearray(), []
+    for name, frames in OBJ_FRAMES:
+        obj_enum.append(f"{name} = {len(obj_data) // 32}")
+        obj_enum.append(f"{name}_N = {len(frames)}")
+        for g in frames: obj_data += obj_tiles(g)
+    h.append("/* Sprite art: a frame's first tile, from where main.c loads it. Frames are 4 tiles but for OBJ_SMOKE's. */")
+    h.append("enum { " + ", ".join(obj_enum) + f", OBJ_TILES = {len(obj_data) // 32}" + " };")
+    h += ["extern const uint16_t art_obj_pal[16];", "extern const uint8_t art_obj[OBJ_TILES * 32];"]
     h += ["extern const uint8_t art_big[T_COUNT][144];", "extern const uint8_t art_mini[T_COUNT][64];",
           "/* [length - 1][sunk], a row at a time */", "extern const uint8_t art_icon[5][2][ICON_W * ICON_H];", "", "#endif", ""]
     with open(os.path.join(ROOT, "src/art.h"), "w") as f: f.write("\n".join(h))
@@ -835,6 +928,8 @@ def main():
     c.append(f"const uint8_t art_mini[T_COUNT][64] {A4} = {{\n" + ",\n".join("{" + ",".join(map(str, sum(t, []))) + "}" for t in mini) + "\n};")
     ic = ",\n".join("{" + ",".join("{" + ",".join(map(str, sum(s, []))) + "}" for s in n) + "}" for n in icons)
     c.append(f"const uint8_t art_icon[5][2][ICON_W * ICON_H] = {{\n{ic}\n}};")
+    c.append(f"const uint16_t art_obj_pal[16] = {{{','.join(str(rgb15(x)) for x in OBJ_PAL)}}};")
+    c.append(f"const uint8_t art_obj[OBJ_TILES * 32] {A4} = {{\n{c_bytes(obj_data, 32)}\n}};")
     with open(os.path.join(ROOT, "src/art.c"), "w") as f: f.write("\n".join(c) + "\n")
 
     # ---- the preview: the screens at 1x, then every cell and every icon enlarged
@@ -847,7 +942,7 @@ def main():
         return im
     full = shared_pal + [(0, 0, 0)] * 192
     bs, ms = sheet(big, 12, 16, full), sheet(mini, 8, 16, full)
-    prev = Image.new("RGB", (W * 3 + 16, H * 2 + 8 + bs.height * 4 + ms.height * 4 + 90), (60, 60, 60))
+    prev = Image.new("RGB", (W * 3 + 16, H * 2 + 8 + bs.height * 4 + ms.height * 4 + 90 + 70), (60, 60, 60))
     for k, n in enumerate(screens):
         prev.paste(rendered(n), (k * (W + 8), 0))
     y = H + 8
@@ -861,7 +956,19 @@ def main():
             ic_im = Image.new("RGB", (ICON_W, ICON_H))
             ic_im.putdata([full[v] for r in t for v in r])
             prev.paste(ic_im.resize((ICON_W * 3, ICON_H * 3), Image.NEAREST), (s * (ICON_W * 3 + 6), y + n * (ICON_H * 3 + 2)))
-    prev = prev.crop((0, 0, prev.width, y + 5 * (ICON_H * 3 + 2)))
+    y += 5 * (ICON_H * 3 + 2) + 4
+    ox = 0
+    for _, frames in OBJ_FRAMES:                   # every sprite frame, on the grey of this sheet
+        for g in frames:
+            n = len(g)
+            spr = Image.new("RGB", (n, n), (60, 60, 60))
+            for py, r in enumerate(g):
+                for qx, v in enumerate(r):
+                    if v: spr.putpixel((qx, py), snap(OBJ_PAL[v]))
+            prev.paste(spr.resize((n * 3, n * 3), Image.NEAREST), (ox, y))
+            ox += n * 3 + 4
+    y += 16 * 3
+    prev = prev.crop((0, 0, prev.width, y))
     prev.save(os.path.join(ROOT, "tools/art.png"))
     # for looking at each screen closely while drawing
     if os.environ.get("ART_BIG"):

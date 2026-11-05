@@ -301,6 +301,9 @@ static uint8_t ai_hunt(const Board *b) {
     return 0;   /* only reachable once every cell has been fired */
 }
 
+/* If set, runs between the slices of HARD's hunt. It must not touch the board or sim_rand. */
+static void (*ai_between)(void);
+
 /* HARD hunt: a probability map. For every still-alive ship, slide it across
    every position and orientation and count the placements that could still
    hold it; the cell covered by the most placements is the best next shot.
@@ -310,9 +313,14 @@ static uint8_t ai_hunt(const Board *b) {
    # strength HARD is meant to have; ADMIRAL below samples whole fleets instead. */
 static uint8_t ai_prob_pick(const Board *b) {
     uint16_t score[100];
+    uint8_t open[100];          /* unfired and clear of every known ship; worked out once, as it costs 9 reads */
     uint16_t bestv = 0;
     uint8_t s, i, best = 0;
-    for (i = 0; i < 100; i++) score[i] = 0;
+    for (i = 0; i < 100; i++) {
+        score[i] = 0;
+        open[i] = b->st[i] == S_EMPTY && !ai_moated(b, (uint8_t)(i % 10), (uint8_t)(i / 10));
+    }
+    if (ai_between) ai_between();
     for (s = 0; s < NSHIP; s++) {
         uint8_t len = ship_len[s], horiz;
         if (b->hits[s] >= len) continue;               /* sunk */
@@ -321,19 +329,17 @@ static uint8_t ai_prob_pick(const Board *b) {
                 uint8_t x = (uint8_t)(i % 10), y = (uint8_t)(i / 10);
                 uint8_t k, ok = 1;
                 if (horiz ? (x > 10 - len) : (y > 10 - len)) continue;
-                for (k = 0; k < len; k++) {
-                    uint8_t hx = horiz ? (uint8_t)(x + k) : x;
-                    uint8_t hy = horiz ? y : (uint8_t)(y + k);
-                    if (b->st[hy * 10 + hx] != S_EMPTY || ai_moated(b, hx, hy)) {
+                for (k = 0; k < len; k++)
+                    if (!open[horiz ? (uint8_t)(i + k) : (uint8_t)(i + 10 * k)]) {
                         ok = 0;
                         break;
                     }
-                }
                 if (ok)
                     for (k = 0; k < len; k++)
                         score[horiz ? (uint8_t)(y * 10 + x + k)
                                     : (uint8_t)((y + k) * 10 + x)]++;
             }
+        if (ai_between) ai_between();
     }
     /* max score, random tiebreak via the random scan start */
     {

@@ -13,6 +13,10 @@ a preview in `tools/art.png`).
 - Battle: d-pad aims, A fires. Your board, with the enemy's last shot marked, is on the right, over the
   list of enemy ships. A ring is a miss, a spiked cross a hit. Cells around a sunk ship show as dotted water: ships
   never touch, so they cannot be fired at.
+- Each shot flies as a shell and lands in a splash or an explosion, or a longer one with a shake if it sinks a ship, and
+  damaged ships smoke. A or B skips an animation; a skip never fires a shot and a button held down skips nothing. A
+  skip changes nothing in the game: the rules resolve before the shell leaves. ADMIRAL samples against the clock, so its
+  own shots can differ from one run to the next if the timing does.
 - Game over: the win or lose picture for 5 seconds (START or A skips it), then both fleets. START plays again.
 
 Build with Docker (`devkitpro/devkitarm`): `make`. `make run` opens mGBA, `make test` checks the rules on the

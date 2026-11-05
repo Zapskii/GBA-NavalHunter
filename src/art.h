@@ -16,6 +16,10 @@ extern const uint16_t art_win_pal[ART_PAL_N];
 extern const uint8_t art_win[38400];
 extern const uint16_t art_lose_pal[ART_PAL_N];
 extern const uint8_t art_lose[38400];
+/* Sprite art: a frame's first tile, from where main.c loads it. Frames are 4 tiles but for OBJ_SMOKE's. */
+enum { OBJ_SHELL = 0, OBJ_SHELL_N = 1, OBJ_SPLASH = 4, OBJ_SPLASH_N = 4, OBJ_BLAST = 20, OBJ_BLAST_N = 5, OBJ_SMOKE = 40, OBJ_SMOKE_N = 4, OBJ_TILES = 44 };
+extern const uint16_t art_obj_pal[16];
+extern const uint8_t art_obj[OBJ_TILES * 32];
 extern const uint8_t art_big[T_COUNT][144];
 extern const uint8_t art_mini[T_COUNT][64];
 /* [length - 1][sunk], a row at a time */

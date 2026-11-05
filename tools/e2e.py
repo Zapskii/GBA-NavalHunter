@@ -21,6 +21,11 @@ START_X, START_Y = 87, 133  # main.c's PRESS START: odd x
 SPLASH_FRAMES, SPLASH_LOCK = 300, 36
 FRAME_CYCLES = 280896
 THINK_FRAMES = 30
+SHELL_FRAMES, IMPACT_RATE, AFTER_SHOT = 24, 4, 6
+SHOT_LIMIT = 92             # about 1.5 s, the most a shot may take, the enemy's thinking included
+OBJ_ART = 520               # main.c: where art_obj sits in sprite tiles
+OBJ_ANIM, ANIMS, OBJ_SMOKE_AT, SMOKE_MAX = 2, 8, 10, 36
+TIMING = int(os.environ.get("E2E_TIMING", 0))   # extra frames before the first key, so another run deals other seeds
 
 fails = 0
 def check(ok, what):
@@ -102,6 +107,25 @@ class Emu:
         self.tap(A)
     def battle_ready(self):
         return self.wait_state(ST_BATTLE) and self.until(lambda: self.text("status_text") == "YOUR TURN", 30)
+    def land(self):
+        """After a fired shot: wait for the shell to land, which is when the result shows."""
+        return self.until(lambda: self.text("msg_text") != "", SHELL_FRAMES + 2)
+    def sea(self, on):
+        """Stop or start the sea, for checks of whole screens where only brightness may change."""
+        self.poke(self.sym["sea_rate"], bytes([8 if on else 0]))
+    def sprites(self):
+        """Every OAM entry that shows: (index, x, y, tile, affine, its matrix)."""
+        oam, out = self.peek(OAM, 128 * 8), []
+        for n in range(128):
+            a0, a1, a2 = (int.from_bytes(oam[n * 8 + k:n * 8 + k + 2], "little") for k in (0, 2, 4))
+            if a0 >> 8 & 3 == 2: continue
+            y, x = a0 & 0xFF, a1 & 0x1FF
+            out.append((n, x - 512 if x >= 256 else x, y - 256 if y >= 160 else y, a2 & 0x3FF, bool(a0 & 0x100), a1 >> 9 & 31))
+        return out
+    def smoke(self): return [o for o in self.sprites() if OBJ_SMOKE_AT <= o[0] < OBJ_SMOKE_AT + SMOKE_MAX]
+    def effects(self): return [o for o in self.sprites() if OBJ_ANIM <= o[0] < OBJ_ANIM + ANIMS]
+    def matrix(self, n):
+        return int.from_bytes(self.peek(OAM + n * 32 + 6, 2), "little")
 
 def seg(own, i):
     """gfx_segment's rule, written again from the brief: a cell's segment from its same-id neighbours."""
@@ -155,8 +179,34 @@ def check_fade(what, start, frames):
     check(all(is_black(f) for f in frames[black[0]:black[-1] + 1]), f"{what}: then black, unbroken ({black[-1] - black[0] + 1} frames)")
     check(all(dims(f, final) for f in frames[black[-1] + 1:]), f"{what}: then the new picture only brightens ({len(frames) - black[-1] - 1} frames)")
 
+def sea_turned(pal, shared):
+    """The first 16 of pal are the first 16 of shared, rotated. Returns by how many, or None."""
+    want = [shared[k * 2:k * 2 + 2] for k in range(16)]
+    got = [pal[k * 2:k * 2 + 2] for k in range(16)]
+    for r in range(16):
+        if all(got[k] == want[(k + r) % 16] for k in range(16)): return r
+    return None
+
 def shared_range_kept(e, where):
-    check(e.pal(0, ART_PAL_FIRST) == e.art("art_shared_pal", ART_PAL_FIRST * 2), f"{where}: palette 0-63 is the shared one")
+    pal, shared = e.pal(0, ART_PAL_FIRST), e.art("art_shared_pal", ART_PAL_FIRST * 2)
+    check(pal[32:] == shared[32:], f"{where}: palette 16-63 is the shared one")
+    check(sea_turned(pal, shared) is not None, f"{where}: palette 0-15 is the sea, at some step of its cycle")
+
+def sea_moves(e, where, skip_rows=()):
+    """Over 60 frames the sea's colours turn, with not one pixel redrawn and no other colour touched,
+    but for skip_rows, where something else is known to draw."""
+    shared = e.art("art_shared_pal", ART_PAL_FIRST * 2)
+    pal0, fb0, seen = e.pal(0, 256), e.fb(), set()
+    for _ in range(60):
+        e.run(1)
+        seen.add(sea_turned(e.pal(0, 16), shared))
+    pal1, fb1 = e.pal(0, 256), e.fb()
+    fb0, fb1 = [bytes(f[y * 240:(y + 1) * 240]) for f in (fb0, fb1) for y in range(160) if y not in skip_rows], None
+    fb0, fb1 = fb0[:len(fb0) // 2], fb0[len(fb0) // 2:]
+    check(pal0[:32] != pal1[:32] and None not in seen, f"{where}: the sea palette turns over 60 frames, {len(seen)} steps")
+    check(6 <= len(seen) <= 9, f"{where}: slowly, about a step every 8 frames")
+    check(pal0[32:] == pal1[32:], f"{where}: and nothing above entry 15 changes")
+    check(fb0 == fb1, f"{where}: while the framebuffer does not")
 
 def chrome_clear_of_sea(fb, what):
     """Nothing but water sits in the sea range. Everything outside the boards' cells must be above it."""
@@ -280,9 +330,328 @@ def admiral_game(e, midshot=None):
     check(e.u32("frame_drops") == drops0, f"no frame dropped through it ({e.u32('frame_drops') - drops0})")
     return rows
 
+def fresh_game(level):
+    """A new power-on at a level, with the same keys at the same frames, so the same seed every time."""
+    e = Emu("navalhunter.gba")
+    e.run(10 + TIMING); e.tap(START); e.wait_state(ST_MENU, 40); e.run(5)
+    while e.u8("ai_level") != level: e.tap(SELECT)
+    enter_battle(e)
+    e.run(30)
+    return e
+
+def chrome_true(e, calm=None):
+    """Off the boards, is each screen pixel what its VRAM index says, in one colour per index? A picture
+    that is still offset fails that, and a brightness left on fails against calm, the same check earlier."""
+    fb, px, m = e.fb(), e.grab().tobytes(), {}
+    for y in range(160):
+        for x in range(240):
+            if any(bx <= x <= bx + 10 * s and by <= y <= by + 10 * s for bx, by, s in (BIG, SMALL)): continue
+            c = px[(y * 240 + x) * 3:(y * 240 + x) * 3 + 3]
+            if m.setdefault(fb[y * 240 + x], c) != c: return False
+    return not calm or all(m.get(k) == v for k, v in calm.items())
+
+def chrome_colours(e):
+    fb, px = e.fb(), e.grab().tobytes()
+    return {C_BG: px[:3], C_INK: next(px[i * 3:i * 3 + 3] for i in range(38400) if fb[i] == C_INK)}
+
+def animation_checks():
+    # --- a fresh game, a shot at a time, frame by frame
+    e = fresh_game(1)
+    own_o, own_p = e.board("ob")[0], e.board("pb")[0]
+    sea_moves(e, "battle")
+    calm = chrome_colours(e)
+    drops0 = e.u32("frame_drops")
+    # the first shot is a sinking, on a clean screen with no marker or smoke: the shake's checks
+    sub = cells(own_o, 5)[0]
+    e.goto(sub % 10, sub // 10)
+    e.sea(0)
+    bg = bytes(calm[C_BG])
+    # the cell's tile as it stands, to see that the board waits for the shell
+    sub_row = e.panel_row(5)
+    e.run(1, A)
+    flight, rows = [], []
+    while e.text("msg_text") == "" and len(flight) < 40:
+        e.run(1, A)                             # held from the press: must not skip
+        check_tile = e.tiles(BIG)[sub]
+        rows.append(e.panel_row(5))
+        flight.append((e.effects(), check_tile, [o for o in e.sprites() if o[0] == 0], e.matrix(0), e.board("ob")[1][sub]))
+        if len(flight) == 12: e.shot("18-shell-flight")
+    check(SHELL_FRAMES - 2 <= len(flight) <= SHELL_FRAMES + 2, f"a shell flies for about {SHELL_FRAMES} frames, A held from the press: {len(flight)}")
+    mid = flight[:-1]
+    check(all(f[4] == S_SUNK for f in flight), "the rules resolved first: st[] holds the result all through the flight")
+    check(all(f[1] == T_WATER for f in mid), "but the board shows it only when the shell lands")
+    check(all(r == sub_row for r in rows[:-1]) and e.panel_row(5) != sub_row, "and the fleet list strikes the ship out only then too")
+    check(all(not f[2] for f in flight), "the cursor is hidden while the shell flies")
+    shells = [f[0][0] for f in mid if f[0]] or [(0, 0, 0, 0, False, 0)]
+    check(len(shells) >= SHELL_FRAMES - 3 and all(s[3] == OBJ_ART + OBJ_SHELL and s[4] and s[5] == 0 for s in shells), f"it is one affine sprite on the shell's art: tile {shells[0][3]}")
+    check(all(s[3] >= 512 for s in shells), "from sprite tile 512 up, where Mode 4 shows them")
+    xs, ys = [s[1] for s in shells], [s[2] for s in shells]
+    tx, ty = BIG[0] + 12 * (sub % 10) + 6 - 8, BIG[1] + 12 * (sub // 10) + 6 - 8
+    check(all(a >= b for a, b in zip(xs, xs[1:])), f"it runs across steadily, from your side to theirs: x {xs[0]} to {xs[-1]}")
+    check(abs(xs[-1] - tx) <= 16 and abs(ys[-1] - ty) <= 24, f"and is nearly on the target a frame or two out: ({xs[-1]},{ys[-1]}) for ({tx},{ty})")
+    line = (ys[0] + ys[-1]) / 2
+    check(min(ys) < line - 15, f"on an arc: top y {min(ys)} over a straight line's {line:.0f}")
+    pas = [f[3] for f in mid if f[0]] or [256]
+    apex = pas[len(pas) // 2]
+    check(apex < pas[0] and apex < pas[-1], f"it scales, largest at the top of the arc and shrinking as it falls: matrix {pas[0]}, {apex}, {pas[-1]}")
+    # the sinking: flash, shake, blasts; every frame
+    frames, seen = [], []
+    f0 = e.u32("frames")
+    while e.text("status_text") != "ENEMY TURN" and len(frames) < 80:
+        e.run(1)
+        frames.append(e.grab()); seen.append(e.effects())
+    check(any(o[3] == OBJ_ART + OBJ_BLAST + 8 for s in seen for o in s), "a sinking shows blast frames")
+    if len(frames) > 4: frames[4].resize((480, 320), Image.NEAREST).save("shots/18c-sinking.png")
+    # shaken: the left of the chrome no longer lines up with VRAM
+    px = lambda im, x, y: im.getpixel((x, y))
+    def shift(im):
+        """How far the picture stands off VRAM, by the ENEMY FLEET line's first letter: None if not found."""
+        for dx in range(-4, 5):
+            for dy in range(-4, 5):
+                seen = {}
+                if all(seen.setdefault(v, px(im, 144 + x - dx, 95 + y - dy)) == px(im, 144 + x - dx, 95 + y - dy) for x, y, v in letter) and len(set(seen.values())) == 2: return dx, dy
+        return None
+    fb = e.fb()
+    letter = [(x, y, fb[(95 + y) * 240 + 144 + x]) for y in range(7) for x in range(30)]
+    shifts = [shift(im) for im in frames[:18]]
+    moved = [s for s in shifts if s and s != (0, 0)]
+    check(len(moved) >= 8, f"a sinking shakes the picture through REG_BG2X/Y: {shifts[:8]}")
+    check(all(abs(a) <= 3 and abs(b) <= 3 for a, b in moved), "by a few pixels at most")
+    # after the flash, while it still shakes: the exposed edge is the chrome's colour, not black or sea
+    late = [(im, s) for im, s in zip(frames[:18], shifts) if s and s != (0, 0)][-3:]
+    def edges(im, s):
+        """The rows and columns the offset has left uncovered."""
+        col = {px(im, 0 if s[0] < 0 else 239, y) for y in range(160)} if s[0] else set()
+        row = {px(im, x, 0 if s[1] < 0 else 159) for x in range(240)} if s[1] else set()
+        return col | row
+    check(late and all(edges(im, q) == {tuple(bg)} for im, q in late), f"the exposed edge is the chrome's colour, not black: {[edges(im, q) for im, q in late]} for {tuple(bg)}")
+    check(chrome_true(e, calm), "after a shake the picture is back: the chrome lines up with VRAM at full brightness")
+    check(not any(BIG[0] + 12 * (sub % 10) <= o[1] < BIG[0] + 12 * (sub % 10) + 12 and BIG[1] + 12 * (sub // 10) <= o[2] < BIG[1] + 12 * (sub // 10) + 12 for o in e.smoke()), "a sunk ship does not smoke")
+    check(sea_turned(e.pal(0, 16), e.art("art_shared_pal", 128)) is not None, "and the backdrop is the sea again")
+    took = e.u32("frames") - f0 + len(flight) + 1
+    check(took <= SHOT_LIMIT, f"your sinking shot took {took} frames, flight included ({took / 60:.2f} s)")
+    # the enemy's shell lands on your board, and the turn comes back
+    n0 = e.u16("shots_fired")
+    t0 = e.u32("frames")
+    le0 = e.u8("last_enemy")
+    while e.board("pb")[1].count(S_EMPTY) == 100 and e.u32("frames") - t0 < THINK_FRAMES + 3: e.run(1)
+    check(e.u32("frames") - t0 <= THINK_FRAMES + 2, "the enemy thinks, then fires")
+    e.run(10)
+    es = e.effects()
+    check(len(es) == 1 and es[0][3] == OBJ_ART + OBJ_SHELL, f"its shell is in the air: {es}")
+    e.shot("18b-enemy-shell")
+    e.run(11)
+    es = e.effects()
+    check(len(es) == 1 and es[0][1] > 120, f"on the way to your board: {es}")
+    check(not [o for o in e.sprites() if o[0] == 1], "and the marker waits for it to land")
+    check(e.battle_ready(), "the turn comes back")
+    took = e.u32("frames") - t0
+    check(took <= SHOT_LIMIT, f"the enemy's shot took {took} frames, thinking included ({took / 60:.2f} s)")
+    check(e.u16("shots_fired") == n0, "A held from the press fired nothing more")
+    check([o for o in e.sprites() if o[0] == 1], "the marker is on your board")
+    check(e.u8("last_enemy") != le0, "at the enemy's last shot")
+    e.sea(1)
+
+    # --- impact art: a miss splashes, a hit explodes, on either board
+    miss = water(own_o)[0]
+    e.goto(miss % 10, miss // 10)
+    e.run(2, A); e.run(2); f0 = e.u32("frames") - 4
+    e.land()
+    e.run(6)
+    es = e.effects()
+    check([o[3] for o in es if o[3] != OBJ_ART + OBJ_SHELL] and all(OBJ_ART + OBJ_SPLASH <= o[3] < OBJ_ART + OBJ_BLAST for o in es), f"a miss is splash frames: {[o[3] for o in es]}")
+    check(all(o[5] == 2 for o in es) and e.matrix(2) == 256, "at the art's own size on the big board")
+    check(all(abs(o[1] + 8 - (BIG[0] + 12 * (miss % 10) + 6)) <= 1 for o in es), "on the target")
+    e.shot("18a-splash")
+    e.until(lambda: e.text("status_text") == "ENEMY TURN", 60)
+    took = e.u32("frames") - f0
+    check(took <= SHOT_LIMIT, f"your miss took {took} frames ({took / 60:.2f} s)")
+    e.until(lambda: any(o[3] != OBJ_ART + OBJ_SHELL for o in e.effects()), THINK_FRAMES + SHELL_FRAMES + 3)
+    es = e.effects()
+    check(es and all(o[5] == 1 for o in es) and e.matrix(1) == 341, f"the enemy's impact is shrunk for the small board: matrix {[o[5] for o in es]}")
+    e.battle_ready()
+    carrier, cruiser = cells(own_o, 0), cells(own_o, 2)[0]
+    e.shoot(cruiser); e.land(); e.run(6)
+    es = e.effects()
+    check(es and all(OBJ_ART + OBJ_BLAST <= o[3] < OBJ_ART + OBJ_SMOKE for o in es), f"a hit is explosion frames: {[o[3] for o in es]}")
+    e.shot("18d-explosion")
+    check(e.battle_ready(), "the turn comes back")
+    smoke = e.smoke()
+    x, y = BIG[0] + 12 * (cruiser % 10), BIG[1] + 12 * (cruiser // 10)
+    check(any(x <= o[1] and o[1] + 8 <= x + 12 and y <= o[2] and o[2] + 8 <= y + 12 for o in smoke), "the hit cell smokes, inside its cell")
+    seen = set()
+    for _ in range(40):
+        e.run(1)
+        seen |= {o[3] for o in e.smoke()}
+    check(len(seen) >= 4 and seen <= set(range(OBJ_ART + OBJ_SMOKE, OBJ_ART + OBJ_SMOKE + OBJ_SMOKE_N)), f"and the smoke loops over its frames: {sorted(seen)}")
+
+    # --- A or B skips, and does no more than skip
+    for key, name, when in ((A, "A", "in flight"), (B, "B", "in flight"), (A, "A", "at the impact"), (B, "B", "at the impact")):
+        e.battle_ready()
+        cell = next(i for i in carrier if e.board("ob")[1][i] == S_EMPTY)
+        fired = e.u16("shots_fired")
+        e.goto(cell % 10, cell // 10)
+        e.run(2, A); e.run(2)
+        if when == "in flight": e.run(4)
+        else: e.land(); e.run(1)
+        f0 = e.u32("frames")
+        e.run(1, key)
+        e.run(1)
+        got = e.text("status_text"), e.tiles(BIG)[cell], e.effects()
+        check(got[1] == T_HIT and not got[2], f"{name} {when} skips to the end: the cell is drawn, nothing is left flying ({got[2]})")
+        check(e.u16("shots_fired") == fired + 1, f"{name} {when}: the press fires nothing itself")
+        check(chrome_true(e, calm), f"{name} {when}: brightness and the picture are restored")
+        e.run(1, key); e.run(1)                 # and still mashing while the enemy thinks
+        if not e.battle_ready(): check(False, "the turn comes back after a skip")
+        check(e.u16("shots_fired") == fired + 1, f"{name} {when}: mashing through the enemy's turn fires nothing")
+    # a skip during the flash and shake of a sinking
+    other_sub = cells(own_o, 6)[0]
+    e.goto(other_sub % 10, other_sub // 10)
+    e.run(2, A); e.run(2)
+    e.land(); e.run(3)                          # flash and shake both running
+    e.run(1, B); e.run(1)
+    check(chrome_true(e, calm), "B during a sinking's flash and shake leaves brightness and BG2X/Y restored")
+    check(not e.effects(), "and no blast left over")
+    # the enemy's shell can be skipped too
+    check(e.until(lambda: e.effects() != [], 60), "the enemy's shell flies")
+    e.run(4)
+    fired = e.board("pb")[1]
+    e.run(2, A)
+    check(not e.effects() and e.u8("last_enemy") < 100 and [o for o in e.sprites() if o[0] == 1], "A skips the enemy's shell, and its shot is marked")
+    # the skipping A is not a shot: held on, with the cursor put on a cell it could fire at, it does nothing
+    check(e.until(lambda: e.state() == ST_BATTLE and e.text("status_text") == "YOUR TURN", 60, A), "and it is your turn")
+    f = e.u16("shots_fired")
+    i = next(i for i in range(100) if e.board("ob")[1][i] == S_EMPTY and not any(e.board("ob")[1][n] == S_SUNK for n in around(i)))
+    e.poke(e.sym["cx"], bytes([i % 10])); e.poke(e.sym["cy"], bytes([i // 10]))
+    e.run(45, A)                                # past the 30-frame refusal a spent cell would give
+    check(e.u16("shots_fired") == f, "a button held from a skip does not fire the next shot")
+    # a fresh press does shoot
+    e.run(2)
+    e.tap(A)
+    check(e.u16("shots_fired") == f + 1, "a fresh press does")
+    e.run(120)
+    check(e.u32("frame_drops") == drops0, f"no frame dropped through all that ({e.u32('frame_drops') - drops0})")
+    e.p.stdin.close(); e.p.wait()
+
+    # --- the sprite budget: 18 hits on both boards, then a shell and impact on top
+    e = fresh_game(2)
+    keep = e.board("ob"), e.board("pb")
+    for name, (own, _, _, _) in zip(("ob", "pb"), keep):
+        e.poke_board(name, own, [S_HIT if own[i] != EMPTY else S_EMPTY for i in range(100)], bytes(7), 7)
+    e.run(40)                                   # the boards repaint the hulls
+    e.poke(e.sym["worst_frame"], bytes(4))
+    e.run(40)
+    idle36 = e.u32("worst_frame")
+    print(f"     idle with 36 smoke sprites: {idle36} of {FRAME_CYCLES} cycles ({idle36 * 100 // FRAME_CYCLES}%)")
+    sm = e.smoke()
+    check(len(sm) == 36, f"18 hits on both boards: 36 smoke sprites ({len(sm)})")
+    own_o, own_p = keep[0][0], keep[1][0]
+    want = {(0, i) for i in range(100) if own_o[i] != EMPTY} | {(1, i) for i in range(100) if own_p[i] != EMPTY}
+    def cell_of(o):
+        if o[1] < SMALL[0]: return 0, (o[2] - BIG[1]) // 12 * 10 + (o[1] - BIG[0]) // 12
+        return 1, (o[2] - SMALL[1]) // 8 * 10 + (o[1] - SMALL[0]) // 8
+    check({cell_of(o) for o in sm} == want, "one on each damaged cell of each board")
+    e.shot("18f-smoke-18-hits")
+    e.poke(e.sym["worst_frame"], bytes(4))
+    i = water(own_o)[0]
+    e.goto(i % 10, i // 10)
+    e.poke(e.sym["worst_frame"], bytes(4))
+    e.run(2, A)
+    peak = 0
+    for k in range(200):
+        e.run(1)
+        all_s = e.sprites()
+        peak = max(peak, len(all_s))
+        if k % 7 == 0 and not all(o[3] >= 512 for o in all_s): check(False, "a sprite below tile 512")
+    check(36 < peak <= 128 and max(o[0] for o in e.sprites()) < OBJ_SMOKE_AT + SMOKE_MAX, f"at the worst {peak} sprites of 128, all at tile 512 up")
+    cost = e.u32("worst_frame")
+    print(f"     worst frame of a whole round with 36 smoke sprites, HARD's map included: {cost} of {FRAME_CYCLES} cycles ({cost * 100 // FRAME_CYCLES}%)")
+    check(cost < FRAME_CYCLES and e.u32("frame_drops") == 0, f"and it fits, no frame dropped ({e.u32('frame_drops')})")
+    # the busiest landings: each ship in turn sunk under all that smoke. The list, the message, a moat
+    # rebuild and the wreck's cells all fall on one frame.
+    e.battle_ready()
+    own, st, hits, alive = e.board("ob")
+    st, hits = bytearray(st), bytearray(hits)
+    last = [cells(own, s)[-1] for s in range(7)]
+    for i in last: st[i] = S_EMPTY
+    for s, n in enumerate(SHIP_LEN): hits[s] = n - 1
+    e.poke_board("ob", own, st, hits, 7)
+    e.run(10)
+    e.poke(e.sym["worst_frame"], bytes(4))
+    for i in last[:-1]:
+        e.battle_ready()
+        e.shoot(i)
+    check(e.battle_ready(), "six ships sunk under the smoke")
+    cost = e.u32("worst_frame")
+    print(f"     worst frame sinking ships under 36 smoke sprites: {cost} of {FRAME_CYCLES} cycles ({cost * 100 // FRAME_CYCLES}%)")
+    check(cost < FRAME_CYCLES and e.u32("frame_drops") == 0, f"and every landing fits its frame, no frame dropped ({e.u32('frame_drops')})")
+    e.p.stdin.close(); e.p.wait()
+
+def play_game(level, skip):
+    """A whole game from a power-on, always shooting water so the enemy gets a full game: the same keys
+    at the same frames, but for A presses during animations if skip. Returns its numbers."""
+    e = fresh_game(level)
+    seed, own_o, st0 = e.u32("game_seed"), e.board("ob")[0], e.board("pb")[0]
+    start = e.u32("frames")
+    aim, rounds, rows, samples = 0, 0, [], []
+    for i in water(own_o) + [i for i in range(100) if own_o[i] != EMPTY]:     # EASY can outlast the water
+        if e.state() != ST_BATTLE: break
+        if e.board("ob")[1][i] != S_EMPTY or any(e.board("ob")[1][n] == S_SUNK for n in around(i)): continue
+        e.goto(i % 10, i // 10)                 # aiming: the time a person would take, not an animation
+        f0 = e.u32("frames")
+        e.run(2, A); e.run(2)
+        if skip:
+            e.run(1, A); e.run(1)               # into the shell's flight
+            e.until(lambda: e.text("status_text") == "ENEMY TURN", 60)
+            pb = e.board("pb")[1]
+            e.until(lambda: e.board("pb")[1] != pb, THINK_FRAMES + 3)
+            e.run(3)
+            if e.board("pb")[3]: e.run(1, B); e.run(1)
+        else:
+            pb = e.board("pb")[1]
+        if e.board("pb")[3] == 0: rounds += 1; break
+        if not e.until(lambda: e.state() == ST_SPLASH or e.state() == ST_BATTLE and e.text("status_text") == "YOUR TURN", 400): break
+        if e.state() == ST_SPLASH: rounds += 1; break
+        rows.append(e.u32("frames") - f0)
+        rounds += 1
+        samples.append(e.u16("samples"))
+    ended = e.wait_state(ST_SPLASH, 400)
+    out = dict(seed=seed, ob=e.board("ob"), pb=e.board("pb"), rounds=rounds, frames=e.u32("frames") - start, rows=rows, ended=ended,
+               samples=samples, drops=e.u32("frame_drops"), worst=e.u32("worst_frame"), sim=e.peek(e.sym["sim_state"], 4), enemy_shots=sum(c != S_EMPTY for c in e.board("pb")[1]))
+    e.p.stdin.close(); e.p.wait()
+    return out
+
+def whole_games():
+    # --- the same seed and inputs, with and without skipping. Rules only ever run ahead of the animation.
+    for level, name in ((0, "EASY"), (1, "NORMAL"), (2, "HARD")):
+        plain, skipped = play_game(level, False), play_game(level, True)
+        check(plain["seed"] == skipped["seed"], f"{name}: both games have the same seed {plain['seed']:#x}")
+        check(plain["ended"] and skipped["ended"], f"{name}: both games end ({plain['rounds']} and {skipped['rounds']} rounds)")
+        check(plain["ob"] == skipped["ob"] and plain["pb"] == skipped["pb"], f"{name}: the same final boards with and without skipping")
+        check(plain["sim"] == skipped["sim"], f"{name}: and the generator is in the same state: nothing but the rules called it")
+        check(plain["drops"] == 0 and skipped["drops"] == 0, f"{name}: no frame dropped through a whole game, either way ({plain['drops']}, {skipped['drops']})")
+        check(plain["worst"] < FRAME_CYCLES and skipped["worst"] < FRAME_CYCLES, f"{name}: worst frame {plain['worst']}, {skipped['worst']} of {FRAME_CYCLES}")
+        for g, how in ((plain, "plain"), (skipped, "skipping")):
+            r = g["rows"]
+            print(f"     {name} {how}: {g['rounds']} rounds, {g['frames']} frames ({g['frames'] / 60:.0f} s) with e2e's aiming; round min {min(r)} mean {sum(r) / len(r):.0f} max {max(r)} frames")
+    # ADMIRAL samples against the clock, so its generator's use depends on the frames: a skip may
+    # change its shots, and that is allowed. Your shots' results can't change, and a repeat with the
+    # same keys must match itself, or something else has crept in.
+    plain, again, skipped = play_game(3, False), play_game(3, False), play_game(3, True)
+    check(plain["seed"] == skipped["seed"] == again["seed"], f"ADMIRAL: all three have the same seed {plain['seed']:#x}")
+    check(plain["pb"] == again["pb"] and plain["ob"] == again["ob"], "ADMIRAL: the same keys give the same boards")
+    check(plain["ended"] and skipped["ended"], f"ADMIRAL: games end ({plain['rounds']} and {skipped['rounds']} rounds)")
+    check(plain["ob"][0] == skipped["ob"][0] and plain["pb"][0] == skipped["pb"][0], "ADMIRAL: the same fleets with and without skipping")
+    check(plain["drops"] == 0 and skipped["drops"] == 0, f"ADMIRAL: no frame dropped through a whole game, either way ({plain['drops']}, {skipped['drops']})")
+    check(plain["worst"] < FRAME_CYCLES and skipped["worst"] < FRAME_CYCLES, f"ADMIRAL: worst frame {plain['worst']}, {skipped['worst']} of {FRAME_CYCLES}")
+    print(f"     ADMIRAL: its shots {'match' if plain['pb'] == skipped['pb'] else 'differ'} with skipping, as sampling runs against the clock ({plain['rounds']} v {skipped['rounds']} rounds)")
+    for g, how in ((plain, "plain"), (skipped, "skipping")):
+        s = g["samples"]
+        print(f"     ADMIRAL {how}: mean samples {sum(s) / len(s):.0f}, first 10 {sum(s[:10]) / 10:.0f}, min {min(s)}, under 50 on {sum(v < 50 for v in s)} of {len(s)} turns; {g['frames']} frames, {g['frames'] / 60:.0f} s")
+
 def main():
     e = Emu("navalhunter.gba")
-    e.run(10)
+    e.run(10 + TIMING)
 
     # --- title: only START leaves
     check(e.state() == ST_TITLE, f"booted to the title: state {e.state()}")
@@ -327,11 +696,15 @@ def main():
     e.run(300)
     check(e.u32("frames") - f0 == 300, f"VBlank IRQ ran for all 300 frames ({e.u32('frames') - f0})")
     while e.px(START_X, START_Y) != C_YEL: e.run()
+    sea_moves(e, "title", range(START_Y, START_Y + 8))      # PRESS START blinks
+    e.shot("1c-title-sea")
+    e.sea(0)
     start = e.grab()
     e.run(1, START)
     frames = watch(e, lambda: e.state() == ST_MENU, START)
     check(e.state() == ST_MENU, f"START leaves the title: state {e.state()}")
     check_fade("title to menu", start, frames)
+    e.sea(1)
     shared_range_kept(e, "menu")
 
     # --- menu: SELECT cycles the level, other keys do nothing
@@ -415,7 +788,7 @@ def main():
     check(e.tiles(BIG) == [T_WATER] * 100, "enemy ships hidden: the big board is all water")
     check(e.tiles(SMALL) == want_tiles(own, st, "ships"), "your ships always shown, each cell its segment")
     # every shape is apart from the others: marks must read without colour
-    pal = e.pal(0, 64)
+    pal = e.art("art_shared_pal", 128)
     def bright(v):
         c = pal[v * 2] | pal[v * 2 + 1] << 8
         return 2 * (c & 31) + 5 * (c >> 5 & 31) + (c >> 10 & 31) > 96      # a grey level of about 40%, weights 2:5:1
@@ -427,6 +800,8 @@ def main():
         grey = lambda t: tuple(bright(v) for v in ta[t])
         check(all(len({grey(T_HULL + g), grey(T_HULLHIT + g), grey(T_SUNK + g)}) == 3 for g in range(7)), f"{s}px hull, hit hull and sunk hull differ in black and white")
         check(len(set(ta)) == T_COUNT, f"{s}px all {T_COUNT} tiles are different")
+        marks = [T_MISS, T_HIT, T_KNOWN] + [T_HULL + g for g in range(7)] + [T_HULLHIT + g for g in range(7)] + [T_SUNK + g for g in range(7)]
+        check(all(a == b or a >= 16 for t in marks for a, b in zip(ta[t], ta[T_WATER])), f"{s}px marks and hulls: nothing but water is in the sea's cycle")
     chrome_clear_of_sea(e.fb(), "battle")
     shared_range_kept(e, "battle")
     check(all(set(e.panel_row(s)) != {C_BG} for s in range(7)), "enemy fleet list full in battle")
@@ -462,7 +837,9 @@ def main():
     calm = im.getpixel((470, 10))
     corner = im.getpixel(((BIG[0] + 12 * (hit % 10)) * 2, (BIG[1] + 12 * (hit // 10)) * 2))
     check(corner[0] > 200 and corner[1] > 200 and corner[2] < 60, f"and the cursor shows on screen: {corner}")
-    e.run(2, A); e.run(4)
+    e.run(2, A)
+    check(e.land(), "the shell lands")
+    e.run(2)
     flash = e.shot("8-hit-flash").getpixel((470, 10))
     check(sum(flash) > sum(calm) + 60, f"a hit flashes the screen: {calm} to {flash}")
     st = e.board("ob")[1]
@@ -494,7 +871,7 @@ def main():
     # --- a known water cell is a miss
     miss = water(own_o)[0]
     drawn = e.u32("cells_drawn")
-    e.shoot(miss); e.run(1)
+    e.shoot(miss); e.land()
     st = e.board("ob")[1]
     check(st[miss] == S_MISS, f"shot at known water is a miss: st {st[miss]}")
     check(e.u16("shots_fired") == 2 and e.u16("shots_hit") == 1, "counted as a shot, not a hit")
@@ -518,7 +895,7 @@ def main():
     # --- sinking: the whole ship redraws, the list marks it, the message names it
     sub = cells(own_o, 5)[0]
     row0 = e.panel_row(5)
-    e.shoot(sub); e.run(1)
+    e.shoot(sub); e.land()
     check(e.text("msg_text") == "SUB SUNK", f"message {e.text('msg_text')!r}")
     check(e.peek(SND4ENV)[0] == 0xF7 and e.peek(SND4POLY)[0] == 0x76, "sunk sound on the noise channel")
     e.run(4)
@@ -575,9 +952,11 @@ def main():
     e.run(4)
     e.goto(last % 10, last // 10)
     # A goes down on the last shot and stays down: the picture must hold its whole time regardless
+    e.sea(0)
     frames = watch(e, lambda: e.state() == ST_SPLASH, A)
     check(e.state() == ST_SPLASH, "the last enemy ship sunk brings up the win picture")
     check_fade("battle to win picture", None, frames)
+    e.sea(1)
     e.run(1, A)
     check(e.until(lambda: e.reg(SNDSTAT) & 1, 10, A), "the win jingle sounds on the square channel")
     check(e.peek(SND1ENV)[0] == 0x73, "with the GB's envelope")
@@ -588,11 +967,13 @@ def main():
     f0 = e.u32("frames")
     e.run(SPLASH_FRAMES - 30, A)
     check(e.state() == ST_SPLASH, "a button held since the last shot does not skip it")
+    e.sea(0)
     start = e.grab()
     frames = watch(e, lambda: e.state() == ST_END, A)
     held = e.u32("frames") - f0
     check(e.state() == ST_END and SPLASH_FRAMES - 10 <= held <= SPLASH_FRAMES + 45, f"it holds about 5 seconds, then the end screen: {held} frames to the end screen, fades and painting included")
     check_fade("win picture to end screen", start, frames)
+    e.sea(1)
     shared_range_kept(e, "end screen")
     e.run(120, A)
     check(e.state() == ST_END, "and A still held does not touch the end screen")
@@ -646,11 +1027,13 @@ def main():
     e.run(6)
 
     # --- START replays without the title, cleanly, and deals another fleet
+    e.sea(0)
     start = e.grab()
     e.run(1, START)
     frames = watch(e, lambda: e.state() == ST_MENU, START)
     check(e.state() == ST_MENU, f"START goes to the menu, not the title: state {e.state()}")
     check_fade("end screen to menu", start, frames)
+    e.sea(1)
     shared_range_kept(e, "menu again")
     e.run(5)
     check(e.px(START_X, START_Y) == C_BG, "no PRESS START")
@@ -701,15 +1084,17 @@ def main():
     e.tap(A); e.run(20)
     # the screen, not state: state stays ST_SPLASH until the end screen is up, through a skip's fade
     check(e.state() == ST_SPLASH and e.fb() == win_art and not is_black(e.grab()), "a fresh A while the jingle plays does not skip the picture")
+    sea_moves(e, "win picture")
+    e.shot("11b-win-sea")
     e.run(SPLASH_LOCK)
     f0 = e.u32("frames")
     e.run(2, A)
     check(e.wait_state(ST_END, 40) and e.u32("frames") - f0 < 40, f"a fresh A after it does: {e.u32('frames') - f0} frames to the end screen")
     check(e.u16("shots_fired") == 18 and e.u16("shots_hit") == 18, f"18 shots, 18 hits: {e.u16('shots_fired')}, {e.u16('shots_hit')}")
     cost = e.u32("ai_cycles")
-    print(f"     ai_next at HARD on an empty board: {cost} cycles, {cost / FRAME_CYCLES:.1f} frames (Thumb from ROM)")
+    print(f"     ai_next at HARD on an empty board, the slowest slice: {cost} cycles, {cost / FRAME_CYCLES:.2f} frames (Thumb from ROM)")
     check(cost > ai0, "the HARD hunt was measured")
-    check(cost < THINK_FRAMES * FRAME_CYCLES, f"and it fits the enemy's {THINK_FRAMES}-frame pause")
+    check(cost < FRAME_CYCLES, "and each slice of it fits a frame")
     check(e.u32("frame_drops") == 0, f"no frame dropped through a HARD game ({e.u32('frame_drops')})")
     e.run(10)
     e.shot("13-win-hard")
@@ -797,9 +1182,11 @@ def main():
     e.goto(i % 10, i // 10)
     e.poke(e.sym["worst_frame"], bytes(4))
     e.tap(A)
+    e.sea(0)
     frames = watch(e, lambda: e.state() == ST_SPLASH, START, 200)   # START down from before the picture
     check(e.state() == ST_SPLASH, "the enemy sinking your last ship brings up the lose picture")
     check_fade("battle to lose picture", None, frames)
+    e.sea(1)
     e.run(1, START)
     check(e.fb() == e.art("art_lose", 38400), "the screen is the lose art, pixel for pixel")
     check(e.pal(ART_PAL_FIRST, ART_PAL_N) == e.art("art_lose_pal", ART_PAL_N * 2), "in its palette")
@@ -808,11 +1195,16 @@ def main():
     e.run(SPLASH_LOCK + 30, START)
     check(e.state() == ST_SPLASH, "START held from before the picture does not skip it")
     e.run(2)
+    e.shot("15b-lose-sea-0")
+    e.run(20)
+    e.shot("15c-lose-sea-1")
+    e.sea(0)
     start = e.grab()
     e.run(1, START)
     frames = watch(e, lambda: e.state() == ST_END, START)
     check(e.state() == ST_END and len(frames) < 40, f"a fresh START skips it: {len(frames)} frames to the end screen")
     check_fade("lose picture to end screen", start, frames)
+    e.sea(1)
     e.run(60, START)
     check(e.state() == ST_END, "and that same START, still held, does not leave the end screen")
     e.run(10)
@@ -848,16 +1240,23 @@ def main():
     for i in water(own_o)[::3]: st[i] = S_MISS
     other = bytes((own_o[(i + 37) % 100]) for i in range(100))
     views = []
+    e.sea(0)
     for what, own in (("with its ships", own_o), ("with other ships", other), ("with none", bytes([EMPTY] * 100))):
         # hits[] follows own[]: a partial count can never sink anything
         hits = [sum(st[i] == S_HIT and own[i] == s for i in range(100)) for s in range(7)]
         e.poke_board("ob", own, st, hits, 7)
         e.redraw(BIG)
-        e.run(6)
+        e.run(16)
+        e.until(lambda: e.u32("frames") % 32 == 0)      # one moment of the smoke's loop
+        e.run(1)
         im = e.grab().crop((BIG[0], BIG[1], BIG[0] + 121, BIG[1] + 121))
-        views.append((what, e.tiles(BIG), im.tobytes()))
+        views.append((what, e.tiles(BIG), im.tobytes(), e.smoke()))
+    e.sea(1)
     check(all(v[1] == views[2][1] for v in views), "an unsunk enemy board draws the same cells, ships or none, in VRAM")
-    check(all(v[2] == views[2][2] for v in views), "and the same pixels on the screen")
+    check(all(v[2] == views[2][2] for v in views), "and the same pixels on the screen, sprites and all")
+    check(all(v[3] == views[2][3] for v in views), "and the same smoke sprites, in the same places and frames")
+    n_hits = sum(v == S_HIT for v in st) + sum(v == S_HIT for v in e.board("pb")[1])
+    check(len(views[0][3]) == n_hits, f"one smoke sprite per unsunk hit on either board: {len(views[0][3])} of {n_hits}")
     check(views[0][1] == [T_HIT if st[i] == S_HIT else T_MISS if st[i] == S_MISS else T_WATER for i in range(100)], "hits are the only trace: hit marks, misses, and water")
     e.shot("17-hidden-check")
     check(e.u32("frame_drops") == 0, f"no frame dropped after boot, all games ({e.u32('frame_drops')})")
@@ -873,6 +1272,9 @@ def main():
         e.p.stdin.close(); e.p.wait()
     check(fleets[0] != fleets[1], "power-ons with different key timing deal different fleets")
     check(fleets[0][:100] != fleets[0][100:], "and the two fleets of one game differ")
+
+    animation_checks()
+    whole_games()
 
     print("FAILED" if fails else "all good", f"({fails} failures)")
     return 1 if fails else 0

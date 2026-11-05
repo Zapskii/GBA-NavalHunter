@@ -546,6 +546,9 @@ static int fairness(uint8_t level, int games) {
     return partly;
 }
 
+static int slices;
+static void count_slice(void) { slices++; }
+
 int main(int argc, char **argv) {
     Board b;
     uint8_t i, t;
@@ -796,6 +799,28 @@ int main(int argc, char **argv) {
         printf("sim: hard %.2f avg, random %.2f avg (2000 games each)\n",
                hard_total / 2000.0, rand_total / 2000.0);
         CHECK(rand_total - hard_total > 5500, "prob hunt clearly beats random hunt");
+    }
+
+    /* HARD's hunt in slices, for the ROM's frames: the hook runs, and the shot is the same without it */
+    {
+        int game, same = 1;
+        for (game = 0; game < 200; game++) {
+            uint8_t with, without, i, sunk;
+            uint32_t state;
+            deal(&b, game);
+            for (i = 0; i < 100; i += 3) fire(&b, (uint8_t)(i % 10), (uint8_t)(i / 10), &sunk);
+            ai_clear_queue();
+            state = sim_state;
+            without = ai_next(&b, 2);
+            sim_state = state;
+            ai_between = count_slice;
+            slices = 0;
+            with = ai_next(&b, 2);
+            ai_between = NULL;
+            if (with != without || sim_state == state) same = 0;
+        }
+        CHECK(same, "HARD picks the same shot in slices as in one go");
+        CHECK(slices >= 2, "and the hook does run between the slices");
     }
 
     /* ---- ADMIRAL ---- */
