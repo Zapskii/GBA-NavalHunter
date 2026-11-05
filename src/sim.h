@@ -112,6 +112,61 @@ static uint8_t place_random_one(Board *b, uint8_t s) {
     }
 }
 
+/* A whole random fleet. A very unlucky one starts over rather than spin. */
+static void init_board(Board *b) {
+    uint8_t s;
+    for (;;) {
+        clear_board(b);
+        for (s = 0; s < NSHIP; s++)
+            if (!place_random_one(b, s)) break;
+        if (s == NSHIP) return;
+    }
+}
+
+/* ---------- ADMIRAL's fleet: placed to be harder for a person to find ------
+   Deal CLEVER_DEALS random fleets and keep the one with the lowest score, so nothing but the rules
+   and chance shapes it and no layout is stored. Few deals on purpose: that is the random element,
+   and it is what keeps a hunter who knows this code from learning much. Before play, so no peeking.
+   The weights are a judgement, not a measurement of people. The score is, over the hull cells:
+   - centre heat, min(x, 9-x) + min(y, 9-y), 0 to 8: an assumption that people shoot the middle first.
+   - CLEVER_MOAT per cell of hull and moat on the board: sinking a ship marks its moat as water, so
+     a tighter fleet gives every hunter fewer free cells. This holds whatever the hunter assumes.
+   No checkerboard term: only the subs could use one, and it measured as easier for an informed hunter.
+   More deals or a heavier heat cost plain hunters more, and gave an informed one a bigger lead. */
+#define CLEVER_DEALS 4
+#define CLEVER_MOAT  2
+
+static uint16_t clever_score(const Board *b) {
+    uint16_t row[10], v = 0;
+    uint8_t x, y, r;
+    for (r = 0; r < 10; r++) row[r] = 0;
+    for (y = 0; y < 10; y++)
+        for (x = 0; x < 10; x++) {
+            if (b->own[y * 10 + x] == CELL_EMPTY) continue;
+            v += (uint16_t)((x < 5 ? x : 9 - x) + (y < 5 ? y : 9 - y));
+            for (r = y ? y - 1 : 0; r <= y + 1 && r < 10; r++)
+                row[r] |= (uint16_t)((7u << x >> 1) & 0x3FF);
+        }
+    for (r = 0; r < 10; r++)
+        for (; row[r]; row[r] &= (uint16_t)(row[r] - 1)) v += CLEVER_MOAT;
+    return v;
+}
+
+/* `between` runs after each deal, if not NULL. On the ROM a deal takes up to 54% of a frame and all
+   four up to 124%, so main.c gives each deal its own frame rather than drop one. */
+static void place_fleet_clever(Board *b, void (*between)(void)) {
+    Board t;
+    uint16_t best = 0xFFFF;
+    uint8_t k;
+    for (k = 0; k < CLEVER_DEALS; k++) {
+        uint16_t v;
+        init_board(&t);
+        v = clever_score(&t);
+        if (v < best) { best = v; *b = t; }
+        if (between) between();
+    }
+}
+
 /* Fire at (x,y). Returns:
  *   0 = miss
  *   1 = hit

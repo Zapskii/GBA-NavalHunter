@@ -114,6 +114,63 @@ def last_one_alive(e, name, also_fired):
     e.poke_board(name, own, st, hits, 1)
     return last
 
+# sim.h's dealing, ported so the ROM's fleets can be checked against the seed it used.
+def deal_from(seed):
+    """Returns deal(), which gives the next fleet from that seed in sim_rand's order."""
+    state = [seed or 1]
+    def rand():
+        x = state[0]
+        x ^= x << 13 & 0xFFFFFFFF
+        x ^= x >> 17
+        x ^= x << 5 & 0xFFFFFFFF
+        state[0] = x
+        return x
+    def fits(own, x, y, n, horiz):
+        for k in range(n):
+            cx, cy = (x + k, y) if horiz else (x, y + k)
+            if cx > 9 or cy > 9: return False
+            if any(0 <= cx + dx <= 9 and 0 <= cy + dy <= 9 and own[(cy + dy) * 10 + cx + dx] != EMPTY
+                   for dy in (-1, 0, 1) for dx in (-1, 0, 1)): return False
+        return True
+    def deal():
+        while True:
+            own = [EMPTY] * 100
+            for s, n in enumerate(SHIP_LEN):
+                for _ in range(201):
+                    horiz, x, y = rand() & 1, rand() % 10, rand() % 10
+                    if fits(own, x, y, n, horiz):
+                        for k in range(n): own[y * 10 + x + k if horiz else (y + k) * 10 + x] = s
+                        break
+                else: break
+            else: return bytes(own)
+    return deal
+
+def clever_score(own):
+    v = 0
+    moat = set()
+    for i in range(100):
+        if own[i] != EMPTY:
+            x, y = i % 10, i // 10
+            v += min(x, 9 - x) + min(y, 9 - y)
+            moat |= {i} | set(around(i))
+    return v + 2 * len(moat)
+
+def plain_deal_check(e, what):
+    """A non-ADMIRAL game: both fleets are what the plain deal gives from this game's seed."""
+    deal = deal_from(e.u32("game_seed"))
+    want_o, want_p = deal(), deal()
+    check(e.board("ob")[0] == want_o and e.board("pb")[0] == want_p, f"{what}: both fleets are the plain deal from seed {e.u32('game_seed'):#x}")
+
+def clever_deal_check(e, what):
+    """An ADMIRAL game: the enemy keeps the lowest score of 4 deals, and yours is the next plain deal."""
+    deal = deal_from(e.u32("game_seed"))
+    want_o = min((deal() for _ in range(4)), key=clever_score)   # min keeps the first on a tie, as sim.h does
+    want_p = deal()
+    own_o, own_p = e.board("ob")[0], e.board("pb")[0]
+    check(own_o == want_o, f"{what}: the enemy fleet is the best of 4 deals from seed {e.u32('game_seed'):#x}")
+    check(own_p == want_p, f"{what}: your fleet is the deal after them")
+    check(legal_fleet(own_o) and legal_fleet(own_p), f"{what}: both are legal")
+
 def admiral_game(e, midshot=None):
     """Lose a game to ADMIRAL by only shooting water. Every enemy shot is checked as it lands.
     Returns (turn, samples, tries) per turn, or None if the game stalled."""
@@ -402,6 +459,7 @@ def main():
     e.run(7)                                    # a different moment from the first game
     prev = own_o
     check(enter_battle(e), "replay: A deals a random game")
+    plain_deal_check(e, "HARD")
     e.run(10)
     own_o, st_o, hits_o, alive_o = e.board("ob")
     check(own_o != prev, "two games deal different fleets")
@@ -437,7 +495,20 @@ def main():
     e.tap(START); e.run(5)
     e.tap(SELECT)
     check(e.u8("ai_level") == 3, "ADMIRAL")
-    check(enter_battle(e), "an ADMIRAL game")
+    # through the real menu, a frame at a time: a deal a frame, each within its frame
+    e.poke(e.sym["worst_frame"], bytes(4))
+    drops0, f0 = e.u32("frame_drops"), e.u32("frames")
+    e.run(2, A)
+    check(e.until(lambda: e.state() == ST_BATTLE, 20), "an ADMIRAL game")
+    deal_frames = e.u32("frames") - f0
+    e.run(1)                                    # the frame that dealt your fleet has ended
+    cost = e.u32("worst_frame")
+    check(deal_frames >= 5, f"it took the 4 deals a frame each, after the key: {deal_frames} frames")
+    print(f"     dealing ADMIRAL's fleet: {deal_frames} frames from the key, the worst {cost} of {FRAME_CYCLES} cycles ({cost * 100 // FRAME_CYCLES}%)")
+    check(cost < FRAME_CYCLES and e.u32("frame_drops") == drops0, f"and no frame dropped dealing it ({e.u32('frame_drops') - drops0})")
+    check(e.battle_ready(), "and the first turn comes")
+    clever_deal_check(e, "ADMIRAL")
+    first_admiral = e.board("ob")[0]
     e.run(60)                                   # let the boards paint in
     e.poke(e.sym["ai_cycles"], bytes(4))        # HARD's stall is not ADMIRAL's
     rows = admiral_game(e, (25, "13b-admiral-midgame"))
@@ -468,6 +539,8 @@ def main():
     for _ in range(4): e.tap(SELECT)
     check(e.u8("ai_level") == 3, "ADMIRAL again")
     check(enter_battle(e), "an ADMIRAL game with no valid fleet")
+    clever_deal_check(e, "ADMIRAL again")
+    check(e.board("ob")[0] != first_admiral, "and it is not the fleet of the last ADMIRAL game")
     e.run(60)
     own_p, st_p, hits_p, _ = e.board("pb")
     own_p = bytearray(EMPTY if c == 0 else c for c in own_p)
@@ -492,6 +565,7 @@ def main():
     e.tap(SELECT)
     check(e.u8("ai_level") == 0, "EASY")
     check(enter_battle(e), "third game")
+    plain_deal_check(e, "EASY")
     own_o = e.board("ob")[0]
     last = last_one_alive(e, "pb", True)
     e.run(4)
@@ -512,6 +586,7 @@ def main():
     e.tap(SELECT)
     check(e.u8("ai_level") == 1, "NORMAL")
     check(enter_battle(e), "fourth game")
+    plain_deal_check(e, "NORMAL")
     own_o = e.board("ob")[0]
     e.shoot(water(own_o)[0])
     check(e.battle_ready(), "the turn comes back at NORMAL")

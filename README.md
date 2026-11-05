@@ -6,6 +6,7 @@ turn-based naval combat against the computer. Work in progress, private until re
 Playable from the title to the end screen, with both boards always on screen, in placeholder art.
 
 - Title: START. Menu: A random fleet, B place your own, SELECT cycles the level (EASY, NORMAL, HARD, ADMIRAL).
+  ADMIRAL also deals its own fleet with some care, instead of at random, before you do anything.
 - Placing: d-pad moves, B turns, A places, START randomises the rest. Ships may not touch.
 - Battle: d-pad aims, A fires. Your board, with the enemy's last shot marked, is on the right, over the
   list of enemy ships. Cells around a sunk ship show as pale water: ships never touch, so they cannot be fired at.

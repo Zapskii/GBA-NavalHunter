@@ -10,6 +10,7 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "sim.h"
 
 static int fails = 0;
@@ -71,13 +72,122 @@ static void ai_trace(const Board *b, uint8_t level, uint32_t seed, uint8_t *out)
 
 /* Deal a game the way measure.c does, so every level meets the same fleets. */
 static void deal(Board *b, int g) {
-    uint8_t s;
     sim_seed((uint32_t)(g + 1) * 0x9E3779B1u);
-    for (;;) {
-        clear_board(b);
-        for (s = 0; s < NSHIP; s++) if (!place_random_one(b, s)) break;
-        if (s == NSHIP) return;
+    init_board(b);
+}
+
+/* A whole fleet, judged from own[] and none of the placing code: every ship once, a straight unbroken
+   line of its length, touching no other hull, on a board ready to play. */
+static int fleet_legal(const Board *b) {
+    uint8_t seen[NSHIP] = {0};
+    int i, dx, dy, s;
+    for (i = 0; i < 100; i++) {
+        uint8_t o = b->own[i];
+        if (b->st[i] != S_EMPTY) return 0;
+        if (o == CELL_EMPTY) continue;
+        if (o >= NSHIP) return 0;
+        seen[o]++;
+        for (dy = -1; dy <= 1; dy++)
+            for (dx = -1; dx <= 1; dx++) {
+                int x = i % 10 + dx, y = i / 10 + dy;
+                if (x < 0 || x > 9 || y < 0 || y > 9) continue;
+                if (b->own[y * 10 + x] != CELL_EMPTY && b->own[y * 10 + x] != o) return 0;
+            }
     }
+    for (s = 0; s < NSHIP; s++) {
+        int lo = 100, hi = -1;
+        if (seen[s] != ship_len[s] || b->hits[s]) return 0;
+        for (i = 0; i < 100; i++) if (b->own[i] == s) { if (i < lo) lo = i; hi = i; }
+        if (hi - lo != (ship_len[s] - 1) && hi - lo != (ship_len[s] - 1) * 10) return 0;
+        if (hi - lo == ship_len[s] - 1 && lo / 10 != hi / 10) return 0;
+    }
+    return b->alive == NSHIP;
+}
+
+static int cmp_u32(const void *a, const void *b) {
+    uint32_t x = *(const uint32_t *)a, y = *(const uint32_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* ADMIRAL's fleet placement. The bounds sit outside what 20,000 measured fleets gave: cells 12.2% to
+   24.4%, 45.6% of hull on the edge. */
+static void clever_checks(void) {
+    enum { N = 2000 };
+    static uint32_t hash[N];
+    uint32_t occ[100] = {0}, h = 2166136261u, st;
+    long clever_total = 0, random_total = 0, edge = 0;
+    int g, i, k, distinct = 1, legal = 0;
+    Board b, t;
+
+    /* The other levels and the player's random fleet: from HEAD before this change, fleets of
+       1000 seeds and the generator's state after each. A changed deal or sim_rand order fails. */
+    for (g = 0; g < 1000; g++) {
+        deal(&b, g);
+        for (i = 0; i < 100; i++) h = (h ^ b.own[i]) * 16777619u;
+        h = (h ^ sim_rand()) * 16777619u;
+    }
+    CHECK(h == 0x128d38de, "init_board deals the fleets it always did, in the same sim_rand order");
+
+    /* The score, on fleets worked out by hand, the weights spelled out: changing one should fail here. */
+    clear_board(&b);
+    place_ship(&b, 0, 0, 1, 1, 5);
+    CHECK(clever_score(&b) == 0 + 4 * 2, "a corner sub: no heat, 4 cells of hull and moat");
+    clear_board(&b);
+    place_ship(&b, 4, 5, 1, 1, 5);
+    CHECK(clever_score(&b) == 8 + 9 * 2, "a middle sub: all the heat, 9 cells");
+    clear_board(&b);
+    place_ship(&b, 2, 2, 1, 1, 5);
+    place_ship(&b, 2, 4, 1, 1, 6);              /* moats share a row of 3 */
+    CHECK(clever_score(&b) == 4 + 6 + 15 * 2, "two near subs: a shared moat counts once");
+    clear_board(&b);
+    place_ship(&b, 0, 9, 5, 1, 0);
+    CHECK(clever_score(&b) == 0 + 1 + 2 + 3 + 4 + 12 * 2, "a carrier on the bottom edge");
+
+    /* It keeps the lowest of exactly the deals init_board would give from that seed. */
+    for (g = 0; g < 300; g++) {
+        uint16_t lowest = 0xFFFF;
+        Board keep;
+        sim_seed((uint32_t)(g + 1) * 0x9E3779B1u);
+        for (k = 0; k < CLEVER_DEALS; k++) {
+            init_board(&t);
+            if (clever_score(&t) < lowest) { lowest = clever_score(&t); keep = t; }
+        }
+        st = sim_state;
+        sim_seed((uint32_t)(g + 1) * 0x9E3779B1u);
+        place_fleet_clever(&b, NULL);
+        CHECK(sim_state == st, "it takes exactly CLEVER_DEALS deals of the generator");
+        CHECK(!memcmp(b.own, keep.own, 100), "it keeps the lowest score, the first on a tie");
+    }
+
+    for (g = 0; g < N; g++) {
+        uint32_t f = 2166136261u;
+        sim_seed((uint32_t)(g + 1) * 0xDEADBEEFu);
+        place_fleet_clever(&b, NULL);
+        legal += fleet_legal(&b);
+        clever_total += clever_score(&b);
+        for (i = 0; i < 100; i++) {
+            f = (f ^ b.own[i]) * 16777619u;
+            if (b.own[i] != CELL_EMPTY) {
+                occ[i]++;
+                if (i % 10 == 0 || i % 10 == 9 || i < 10 || i >= 90) edge++;
+            }
+        }
+        hash[g] = f;
+        init_board(&t);
+        random_total += clever_score(&t);
+    }
+    CHECK(legal == N, "every clever fleet is legal and complete");
+    qsort(hash, N, sizeof hash[0], cmp_u32);
+    for (g = 1; g < N; g++) distinct += hash[g] != hash[g - 1];
+    printf("clever: %d of %d layouts distinct, %.1f%% of hull on the edge, score %.1f v %.1f at random\n",
+           distinct, N, edge * 100.0 / (N * 18), (double)clever_total / N, (double)random_total / N);
+    CHECK(distinct >= N - 2, "clever fleets do not repeat");
+    /* Not a habit: no cell near certain or near never, and the edge only somewhat favoured. */
+    for (i = 0; i < 100; i++)
+        CHECK(occ[i] >= N * 8 / 100 && occ[i] <= N * 30 / 100, "no cell is a habit of the clever fleet");
+    CHECK(edge < (long)N * 18 * 52 / 100, "the clever fleet does not hug the edge");
+    /* And it is doing something. Means over 2000: about 203 at best of 4, 217 at random. */
+    CHECK(clever_total + (long)N * 5 < random_total, "clever fleets score lower than random ones");
 }
 
 /* Judge the fleet mc_step just made, from st[] and sunk status alone and none of its code: every
@@ -638,6 +748,7 @@ int main(int argc, char **argv) {
 
     /* ---- ADMIRAL ---- */
     admiral_checks();
+    clever_checks();
 
     /* strength: 2000 fleets at 500 tries a turn, the ROM's mean over the first 10 turns (its whole-
        game mean is about 870, and more tries buy nothing measurable). The fleets are fixed, not

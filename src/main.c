@@ -53,6 +53,7 @@ typedef struct {
 /* Read by tools/e2e.py through the .sym file, so not static. */
 u8 state = ST_BOOT;
 volatile u32 frames, frame_drops;
+u32 game_seed;                  /* this game's sim_seed, so e2e can deal the same fleets itself */
 volatile u32 ai_cycles;         /* the slowest ai_next or mc_pick so far, in CPU cycles */
 volatile u32 worst_frame;       /* the most cycles a frame's work has taken so far */
 u16 samples, sample_tries;      /* ADMIRAL's last turn: valid fleets, and fleets tried */
@@ -330,17 +331,6 @@ static int menu(void)
             ai_level = (ai_level + 1) % 4;
             menu_level();
         }
-    }
-}
-
-static void init_board(Board *b)
-{
-    int s;
-    for (;;) {                  /* a very unlucky fleet starts over rather than spin */
-        clear_board(b);
-        for (s = 0; s < NSHIP; s++)
-            if (!place_random_one(b, s)) break;
-        if (s == NSHIP) return;
     }
 }
 
@@ -639,8 +629,10 @@ int main(void)
         int manual = menu();
         /* After the keypress, per game: human timing is the only entropy here, and seeding
            at boot deals the same fleets every power-on (the GB game had this bug). */
-        sim_seed(frames * 0x9E3779B1u ^ cycles());
-        init_board(&ob);
+        game_seed = frames * 0x9E3779B1u ^ cycles();
+        sim_seed(game_seed);
+        if (ai_level == ADMIRAL) place_fleet_clever(&ob, wait_frame);
+        else init_board(&ob);
         if (manual) place_fleet();
         else init_board(&pb);
         ai_clear_queue();
