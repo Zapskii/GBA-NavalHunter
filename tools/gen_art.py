@@ -535,7 +535,9 @@ def logo(px, text, y, scale, ramp, edge, shadow):
         elif (p[0], p[1] + 1) not in on: c = ramp[-1]
         px[p] = c
 
-SMALL = {  # the credit, in lower case the game's font does not have
+VERSION = "v0.1"    # bottom right of the title; the tag and the release use the same words
+
+SMALL = {  # the credit and version, in lower case the game's font does not have
     "B": ["####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."],
     "y": [".....", ".....", "#...#", "#...#", ".####", "....#", ".###."],
     "Z": ["#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"],
@@ -544,6 +546,10 @@ SMALL = {  # the credit, in lower case the game's font does not have
     "s": [".....", ".....", ".####", "#....", ".###.", "....#", "####."],
     "k": ["#....", "#....", "#..#.", "#.#..", "##...", "#.#..", "#..#."],
     "i": ["..#..", ".....", "..#..", "..#..", "..#..", "..#..", "..#.."],
+    "v": [".....", ".....", "#...#", "#...#", "#...#", ".#.#.", "..#.."],
+    "0": [".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."],
+    "1": ["..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."],
+    ".": [".....", ".....", ".....", ".....", ".....", ".##..", ".##.."],
     " ": ["....."] * 7,
 }
 def small_text(px, x, y, s, c, shadow):
@@ -746,6 +752,7 @@ def title():
     swell(px, 149, 2, 44, 0.4, (10, 34, 72), (40, 96, 148), foam=(216, 240, 248))
     swell(px, 154, 2, 31, 2.1, (6, 22, 50), (24, 64, 112), foam=(168, 208, 232))
     small_text(px, (W - 9 * 6) // 2, 151, "By Zapski", (216, 232, 248), (0, 8, 24))
+    small_text(px, W - len(VERSION) * 6 - 3, 151, VERSION, (216, 232, 248), (0, 8, 24))
     return im
 
 def firework(px, cx, cy, r, c1, c2):
