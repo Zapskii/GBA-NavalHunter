@@ -535,7 +535,7 @@ def logo(px, text, y, scale, ramp, edge, shadow):
         elif (p[0], p[1] + 1) not in on: c = ramp[-1]
         px[p] = c
 
-VERSION = "v0.1"    # bottom right of the title; the tag and the release use the same words
+VERSION = "v1.0"    # bottom right of the title; the tag and the release use the same words
 
 SMALL = {  # the credit and version, in lower case the game's font does not have
     "B": ["####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."],

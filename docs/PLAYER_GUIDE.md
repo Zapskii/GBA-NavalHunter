@@ -154,4 +154,4 @@ fleets in full, your shots and how many of them hit. Press START to play again.
 
 ---
 
-Naval Hunter for Game Boy Advance, v0.1. A port of the Game Boy original by Zapski.
+Naval Hunter for Game Boy Advance, v1.0. A port of the Game Boy original by Zapski.
