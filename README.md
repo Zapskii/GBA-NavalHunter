@@ -4,9 +4,12 @@ A full-colour Game Boy Advance port of [Naval Hunter](https://github.com/Zapskii
 combat for the original Game Boy. You against the computer: hunt and sink its fleet before it sinks yours. Both
 boards are always on screen, every shell flies, and the top level plays against whole fleets it imagines.
 
-![Title](docs/title.png) ![Battle](docs/battle.png)
+![Title](docs/img/title.png) ![Battle](docs/img/battle.png)
 
-![Damage](docs/damage.png) ![You win](docs/win.png) ![You lose](docs/lose.png)
+![You win](docs/img/win.png) ![You lose](docs/img/lose.png)
+
+**How to play:** see the [Player Guide](docs/PLAYER_GUIDE.md) ([HTML](docs/PLAYER_GUIDE.html)) for controls, how to read
+the boards, the levels and tips.
 
 ## Controls
 
@@ -64,6 +67,7 @@ Needs Docker (the `devkitpro/devkitarm` image).
     make run        # open it in mGBA
     make test       # host tests of the rules and the AI
     make e2e        # plays the real ROM headlessly in libmgba (brew install mgba); shots/
+    make guide      # plays the real ROM for the player guide's pictures (docs/img)
 
 The art and the sounds are drawn and synthesised from nothing by `tools/gen_art.py` (needs Pillow) and
 `tools/gen_sfx.py` (standard library only). Their output in `src/` is committed, so a plain `make` needs no Python.

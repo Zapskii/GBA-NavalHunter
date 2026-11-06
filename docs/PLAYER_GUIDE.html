@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Naval Hunter Guide</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Silkscreen&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap">
+<style>
+  /* Layout: one 760px column, in the game's own colours: the chrome's navy, the sea's blue for
+     frames, the message line's yellow. One theme, as the game has. */
+  :root {
+    --bg: #081029;          /* the game's C_BG */
+    --panel: #0f1c3f;
+    --line: #2b4a78;
+    --sea: #4a8bbd;
+    --fg: #e8eef6;
+    --muted: #a3b4cc;
+    --yellow: #ffef42;      /* the message line */
+    --ink: #1a1a06;
+    --display: "Silkscreen", ui-monospace, monospace;
+    --body: "Atkinson Hyperlegible", system-ui, -apple-system, sans-serif;
+    color-scheme: dark;
+  }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 17px/1.6 var(--body); }
+  main {
+    max-width: 760px; margin: 0 auto;
+    padding-block: 28px 64px;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr);
+  }
+  img { max-width: 100%; }
+  .px { image-rendering: pixelated; }
+  h1, h2, h3 { font-family: var(--display); font-weight: 400; text-wrap: balance; letter-spacing: 0.02em; }
+  h1 { font-size: clamp(1.9rem, 6vw, 2.8rem); line-height: 1.1; margin: 0; color: var(--yellow); }
+  h2 { font-size: 1.35rem; margin: 1.8em 0 0.3em; padding-bottom: 6px; border-bottom: 3px solid var(--line); }
+  h3 { font-size: 1.05rem; margin: 1.1em 0 0.1em; color: var(--yellow); }
+  p, li { max-width: 65ch; }
+  p { margin: 0.4em 0; }
+  ul { margin: 0.4em 0; padding-left: 1.2em; }
+  li { margin: 0.25em 0; }
+  a { color: var(--yellow); }
+  .lede { color: var(--muted); font-size: 1.1rem; margin-top: 4px; }
+  .shot { margin: 10px 0; display: grid; gap: 6px; }
+  .shot img { width: 480px; height: auto; border: 4px solid var(--line); outline: 2px solid #000; border-radius: 2px; background: #000; }
+  .shot figcaption { color: var(--muted); font-size: 0.9rem; }
+  .pair { display: flex; flex-wrap: wrap; gap: 14px; }
+  .pair .shot { flex: 1 1 300px; min-width: 0; }
+  .pair .shot img { width: 100%; box-sizing: border-box; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; margin: 6px 0 12px; }
+  th, td { text-align: left; padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { font-family: var(--display); font-weight: 400; font-size: 0.8rem; letter-spacing: 0.06em; color: var(--muted); }
+  td.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  td.where { color: var(--muted); white-space: nowrap; }
+  kbd {
+    font: 700 0.85em var(--body); white-space: nowrap;
+    background: var(--panel); color: var(--fg);
+    border: 1px solid var(--line); border-bottom-width: 3px; border-radius: 4px; padding: 0 6px;
+  }
+  .msg { font-family: var(--display); color: var(--yellow); letter-spacing: 0.02em; white-space: nowrap; }
+  .things { display: grid; gap: 10px; margin: 8px 0 14px; }
+  .thing {
+    display: grid; grid-template-columns: 84px minmax(0, 1fr); gap: 14px; align-items: center;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 10px 14px 10px 10px;
+  }
+  .thing .art { display: grid; place-items: center; }
+  .thing .art img { width: 72px; height: 72px; }
+  .thing b { font-family: var(--display); font-weight: 400; color: var(--yellow); letter-spacing: 0.03em; }
+  .thing p { margin: 2px 0 0; }
+  .fleet td:first-child { width: 96px; }
+  .fleet img { display: block; width: 84px; height: 21px; }
+  footer { color: var(--muted); font-size: 0.9rem; margin-top: 2.5em; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1>Naval Hunter</h1>
+  <p class="lede">Player guide for the Game Boy Advance version. Two fleets, two grids, one shell at a time.</p>
+</header>
+
+<figure class="shot">
+  <img class="px" src="img/title.png" width="480" height="320" alt="The title screen: NAVAL HUNTER over a warship firing, PRESS START">
+</figure>
+
+<p>You can't see the enemy's ships, and it can't see yours. Sink all seven of its ships before it sinks all seven of yours.</p>
+
+<h2>Controls</h2>
+<div class="table-wrap"><table>
+  <tr><th>Screen</th><th>Button</th><th>Action</th></tr>
+  <tr><td class="where">Title</td><td><kbd>Start</kbd></td><td>Go to the menu</td></tr>
+  <tr><td class="where">Menu</td><td><kbd>A</kbd></td><td>Deal your fleet at random and start</td></tr>
+  <tr><td></td><td><kbd>B</kbd></td><td>Place your own fleet</td></tr>
+  <tr><td></td><td><kbd>Select</kbd></td><td>Change the level</td></tr>
+  <tr><td class="where">Placing ships</td><td><kbd>D-pad</kbd></td><td>Move the ship</td></tr>
+  <tr><td></td><td><kbd>B</kbd></td><td>Turn it</td></tr>
+  <tr><td></td><td><kbd>A</kbd></td><td>Place it</td></tr>
+  <tr><td></td><td><kbd>Start</kbd></td><td>Deal the rest at random and start</td></tr>
+  <tr><td class="where">Battle</td><td><kbd>D-pad</kbd></td><td>Aim (hold to keep moving; the cursor wraps round the edges)</td></tr>
+  <tr><td></td><td><kbd>A</kbd></td><td>Fire</td></tr>
+  <tr><td></td><td><kbd>A</kbd> or <kbd>B</kbd></td><td>While a shot is showing: skip the animation</td></tr>
+  <tr><td class="where">Win or lose picture</td><td><kbd>Start</kbd> or <kbd>A</kbd></td><td>Skip it</td></tr>
+  <tr><td class="where">Both fleets, at the end</td><td><kbd>Start</kbd></td><td>Play again, from the menu</td></tr>
+</table></div>
+<p>There's no pause, and none is needed: nothing happens until you fire. Nothing is saved when you switch off.</p>
+
+<h2>Starting a game</h2>
+<figure class="shot">
+  <img class="px" src="img/menu.png" width="480" height="320" alt="The menu: PLACE YOUR FLEET? A RANDOM, B MANUAL, SELECT LEVEL: HARD">
+</figure>
+<p>Press <kbd>Select</kbd> until you see the level you want, then press <kbd>A</kbd> or <kbd>B</kbd>. The level stays set when you play again.</p>
+
+<h3>The fleet</h3>
+<p>Both sides have the same seven ships, 18 squares to hit on each side:</p>
+<div class="table-wrap"><table class="fleet">
+  <tr><th></th><th>Length</th><th>How many</th></tr>
+  <tr><td><img class="px" src="img/ship5.png" alt="A five-square ship"></td><td class="num">5</td><td class="num">1</td></tr>
+  <tr><td><img class="px" src="img/ship4.png" alt="A four-square ship"></td><td class="num">4</td><td class="num">1</td></tr>
+  <tr><td><img class="px" src="img/ship3.png" alt="A three-square ship"></td><td class="num">3</td><td class="num">1</td></tr>
+  <tr><td><img class="px" src="img/ship2.png" alt="A two-square ship"></td><td class="num">2</td><td class="num">2</td></tr>
+  <tr><td><img class="px" src="img/ship1.png" alt="A one-square ship"></td><td class="num">1</td><td class="num">2</td></tr>
+</table></div>
+
+<h3>Placing your own</h3>
+<p>Ships come in order, longest first. <strong>Ships may not touch, not even at a corner.</strong> The bottom line names the ship and says <span class="msg">OK</span> or <span class="msg">NO FIT</span>. A ship that doesn't fit shows in red, and pressing <kbd>A</kbd> then says <span class="msg">TOO CLOSE</span> and leaves it unplaced. After each ship is placed, the next one starts at the top left, often on top of something, so expect to see it red at first.</p>
+<div class="pair">
+  <figure class="shot"><img class="px" src="img/place-no-fit.png" width="480" height="320" alt="The next ship over the carrier, in red: NO FIT"><figcaption>In the way of the last ship: red, NO FIT.</figcaption></figure>
+  <figure class="shot"><img class="px" src="img/place.png" width="480" height="320" alt="The same ship moved clear: OK"><figcaption>Moved clear: OK.</figcaption></figure>
+</div>
+
+<h2>The screen</h2>
+<figure class="shot">
+  <img class="px" src="img/battle.png" width="480" height="320" alt="A game in progress: the enemy's waters on the left, yours on the right, over the list of enemy ships">
+</figure>
+<ul>
+  <li><strong>Left, the big board:</strong> the enemy's waters, where you aim. The yellow square is your cursor.</li>
+  <li><strong>Top right, YOUR WATERS:</strong> your fleet and the enemy's shots. A white square marks its last shot.</li>
+  <li><strong>Bottom right, ENEMY FLEET:</strong> what you still have to sink. A sunk ship is crossed out in red.</li>
+  <li><strong>Bottom left:</strong> the result of the last shot.</li>
+</ul>
+
+<h3>Reading the boards</h3>
+<div class="things">
+  <div class="thing"><div class="art"><img class="px" src="img/water.png" alt="Plain water"></div>
+    <div><b>Plain water</b><p>Unknown on the enemy's board. Nothing there on yours.</p></div></div>
+  <div class="thing"><div class="art"><img class="px" src="img/miss.png" alt="A white ring on water"></div>
+    <div><b>Ring</b><p>A miss.</p></div></div>
+  <div class="thing"><div class="art"><img class="px" src="img/hit.png" alt="A spiked orange cross on water"></div>
+    <div><b>Spiked cross, smoking</b><p>A hit on the enemy's board. It doesn't show which way the ship runs.</p></div></div>
+  <div class="thing"><div class="art"><img class="px" src="img/hullhit.png" alt="A spiked orange cross on a grey hull"></div>
+    <div><b>Spiked cross on a hull</b><p>A hit on your own ship.</p></div></div>
+  <div class="thing"><div class="art"><img class="px" src="img/sunk.png" alt="A red X on a charred hull"></div>
+    <div><b>Red X on a charred hull</b><p>A sunk ship. Now you can see its shape.</p></div></div>
+  <div class="thing"><div class="art"><img class="px" src="img/known.png" alt="Dotted water"></div>
+    <div><b>Dotted water</b><p>Next to a sunk ship, so it can't hold a ship.</p></div></div>
+</div>
+
+<h2>How a turn goes</h2>
+<p>You fire, then the enemy fires. A hit doesn't earn another shot.</p>
+<p>Your shell arcs across the screen, and you only find out what it did when it lands: a splash for a miss, an explosion for a hit. A sinking blasts along the whole ship, with a bright flash and a shake, and the ship goes red in the fleet list. Then the enemy's turn runs the same way on your board.</p>
+<div class="pair">
+  <figure class="shot"><img class="px" src="img/shell.png" width="480" height="320" alt="Your shell in flight over the enemy's board"><figcaption>The shell in flight.</figcaption></figure>
+  <figure class="shot"><img class="px" src="img/splash.png" width="480" height="320" alt="A splash where it landed: MISS"><figcaption>A miss.</figcaption></figure>
+  <figure class="shot"><img class="px" src="img/explosion.png" width="480" height="320" alt="An explosion: HIT!"><figcaption>A hit.</figcaption></figure>
+  <figure class="shot"><img class="px" src="img/sinking.png" width="480" height="320" alt="Blasts along a whole ship as it sinks, with the ship crossed out in the fleet list"><figcaption>A sinking.</figcaption></figure>
+</div>
+<p>Each shot takes about a second. To hurry things along, press <kbd>A</kbd> or <kbd>B</kbd> while one is showing. That only skips the animation and never changes the result, and it doesn't fire your next shot. Holding a button down doesn't skip.</p>
+<p>Two shots are refused and don't cost you a turn:</p>
+<ul>
+  <li><span class="msg">ALREADY SHOT</span>: you've fired at that square before.</li>
+  <li><span class="msg">KNOWN WATER</span>: the dotted squares around a sunk ship.</li>
+</ul>
+<figure class="shot">
+  <img class="px" src="img/known-water.png" width="480" height="320" alt="Aiming at a dotted square beside a sunk ship: KNOWN WATER">
+</figure>
+
+<h2>The levels</h2>
+<p>The computer plays fair at every level. It knows only what you could know: where its shots landed, and which ships it has sunk. It never looks at your hidden fleet.</p>
+<p>EASY, NORMAL and HARD all try the squares around a hit and follow the line once they have two in a row. They differ in how they search:</p>
+<div class="table-wrap"><table>
+  <tr><th>Level</th><th>How it searches</th><th>Average</th><th>Worst</th></tr>
+  <tr><td><strong>EASY</strong></td><td>At random, even into water it could rule out</td><td class="num">83</td><td class="num">100</td></tr>
+  <tr><td><strong>NORMAL</strong></td><td>At random, but clear of ships it has already found</td><td class="num">59</td><td class="num">87</td></tr>
+  <tr><td><strong>HARD</strong></td><td>At the square the most possible ship positions would cover</td><td class="num">54</td><td class="num">81</td></tr>
+  <tr><td><strong>ADMIRAL</strong></td><td>Imagines hundreds of whole fleets that fit what it has seen, and fires where most of them have a ship</td><td class="num">53</td><td class="num">78</td></tr>
+</table></div>
+<p>Average and Worst are the shots it takes to sink a random fleet, from simulated games. They're a target to beat: on NORMAL, you need to finish in under about 59 shots to win more often than not.</p>
+<p><strong>ADMIRAL</strong> also places its own fleet with care instead of at random. It deals several fleets and keeps the one that looks hardest to find, so expect to need a few more shots than on HARD. It's the only level that does this.</p>
+
+<h2>Winning and losing</h2>
+<p>The first side to lose all seven ships loses the game. You get the win or lose picture for about 5 seconds (after a moment you can skip it), then both fleets in full, your shots and how many of them hit. Press <kbd>Start</kbd> to play again.</p>
+<div class="pair">
+  <figure class="shot"><img class="px" src="img/win.png" width="480" height="320" alt="YOU WIN: the warship at dusk with fireworks"></figure>
+  <figure class="shot"><img class="px" src="img/lose.png" width="480" height="320" alt="YOU LOSE: the warship sinking in flames"></figure>
+  <figure class="shot"><img class="px" src="img/win-end.png" width="480" height="320" alt="The end screen after a win: 41 SHOTS 43%"></figure>
+  <figure class="shot"><img class="px" src="img/lose-end.png" width="480" height="320" alt="The end screen after a loss, with the enemy's last ship revealed: 47 SHOTS 36%"></figure>
+</div>
+
+<h2>Tips</h2>
+<ul>
+  <li><strong>The corners of a hit are always water.</strong> Ships run in straight lines and can't touch, so only the four squares directly next to a hit can hold the rest of that ship. Don't waste shots on the diagonals.</li>
+  <li><strong>Two hits in a row give you the line.</strong> The squares along the sides of those hits are water too.</li>
+  <li><strong>Spread your search.</strong> Until you've found the longer ships, fire with gaps between your shots. Close the gaps as the long ships go down. Check the fleet list to see what's left.</li>
+  <li><strong>Expect the subs to come last.</strong> A one-square sub can sit in any gap, and one hit sinks it. Dotted water helps a lot here, since it rules squares out for free.</li>
+  <li><strong>Use the wrap.</strong> The cursor wraps round the edges, so from column A, one press left takes you to column J.</li>
+  <li><strong>Check the edges on ADMIRAL.</strong> Its careful fleets sit on the edge of the board a little more often than a random fleet does, though not by so much that you can count on it.</li>
+</ul>
+
+<footer>Naval Hunter for Game Boy Advance, v0.1. A port of the Game Boy original by Zapski.</footer>
+</main>
+</body>
+</html>

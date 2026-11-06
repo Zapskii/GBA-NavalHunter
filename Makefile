@@ -3,6 +3,7 @@
 #   make run    open it in mGBA
 #   make test   host tests of the rules (plain cc)
 #   make e2e    drive the real ROM headlessly in libmgba; screenshots in shots/
+#   make guide  play the real ROM for the player guide's pictures, in docs/img
 
 ROM   = navalhunter.gba
 SRCS  = src/main.c src/gfx.c src/art.c src/sfx_data.c
@@ -34,7 +35,10 @@ emu: tools/emu.c
 e2e: $(ROM) emu
 	python3 tools/e2e.py
 
+guide: $(ROM) emu
+	python3 tools/gen_guide_images.py
+
 clean:
 	rm -f $(ROM) navalhunter.elf navalhunter.sym test_sim emu
 
-.PHONY: run test e2e clean
+.PHONY: run test e2e guide clean
