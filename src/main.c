@@ -82,6 +82,9 @@ u8 think_frames;                /* frames the enemy's last turn spent thinking *
 volatile u32 cells_drawn;
 volatile u32 jingle_notes;      /* notes started on any channel, ever */
 volatile u32 music_cycles;      /* the most cycles music_step has taken in the VBlank handler */
+volatile u16 sfx_left;          /* frames until the sample playing stops; 0 = none */
+u8 sfx_cur;                     /* the last sample started */
+volatile u32 sfx_starts;        /* samples started, ever */
 Board pb, ob;                   /* your waters, enemy waters */
 u8 ai_level = 1;
 u8 cx, cy;
@@ -193,6 +196,7 @@ static void sync_boards(void)
 
 /* ---------------------------------------------------------------- frame */
 static void music_step(void);
+static void sfx_stop(void);
 
 static void on_vbl(void)
 {
@@ -212,6 +216,7 @@ static void on_vbl(void)
     music_step();
     c = cycles() - c;
     if (c > music_cycles) music_cycles = c;
+    if (sfx_left && !--sfx_left) sfx_stop();
 }
 
 /* ---------------------------------------------------------------- animation */
@@ -446,15 +451,17 @@ static void panel_line(const Board *b, int s)
 }
 
 /* ---------------------------------------------------------------- sound */
-/* Effects: CH4 only, and each writes its whole setup every time. Music never touches CH4. */
+/* Bits 0-1: PSG 100%, which the music's levels are set for. Direct Sound A at 50% on both sides from timer 0: at
+   100% a loud sample and the jingle together would pass the top of the mixer. Every write to REG_SNDDSCNT is this,
+   with the FIFO reset bit or without. */
+#define SND_MIX (SDS_DMG100 | SDS_A50 | SDS_AL | SDS_AR | SDS_ATMR0)
 static void sound_init(void)
 {
     REG_SNDSTAT = 0x80;         /* PSG on (must be first) */
     /* All channels both sides, master 7. Each PSG channel spans a quarter of the output, so all four at
        full volume just reach the top: the PSG can't clip against itself. */
     REG_SNDDMGCNT = 0xFF77;
-    /* Bits 0-1: PSG mix 100%. Direct Sound's bits are clear, ready for Phase 8 to add. */
-    REG_SNDDSCNT = 2;
+    REG_SNDDSCNT = SND_MIX;
     REG_SND1SWEEP = 0;          /* never swept */
     /* CH3's wave, once only and with the channel off: writing wave RAM while CH3 plays is the classic
        bug. Bank 1 is selected, so the writes fill bank 0, which is the one a note plays. */
@@ -464,16 +471,40 @@ static void sound_init(void)
     REG_SND3SEL = 0;
 }
 
-static void sound_explosion(int big_one)
+/* Effects: one voice of samples on Direct Sound A, from ROM by DMA 1 at timer 0's rate. tools/gen_sfx.py makes
+   them, each ending in enough silence that the output is at 0 when it stops and the DMA, which reads ahead of what
+   has played, never leaves it. So no stop needs a fade, and nothing rings on: the longest sample ends before the
+   quickest way back to the menu gets there (tools/e2e.py). Nothing here calls sim_rand. */
+typedef struct { const s8 *data; u32 len; u16 frames; } Sfx;
+extern const Sfx sfx_table[4];
+extern const u16 sfx_reload;
+enum { SFX_SPLASH, SFX_EXPLOSION, SFX_BOOM, SFX_PING };
+
+/* From the VBlank handler at the end of a sample, and at each start. The DMA first, so it can't take one more
+   word into a FIFO just reset. */
+static void sfx_stop(void)
 {
-    REG_SND4CNT = big_one ? 0xF700 : 0xF300;    /* a ship going down decays slower... */
-    REG_SND4FREQ = 0x8000 | (big_one ? 0x76 : 0x65);   /* ...and is lower */
+    REG_DMA1CNT = 0;
+    REG_TM0CNT = 0;
+    REG_SNDDSCNT = SND_MIX | SDS_ARESET;
 }
 
-static void sound_tick(void)
+/* A newer effect replaces the current one, but a sinking outlives a miss. The counter is cleared first and set
+   last, so the handler can't stop this start part way, or with the last sample's count. */
+static void sfx_play(int id)
 {
-    REG_SND4CNT = 0x2100;
-    REG_SND4FREQ = 0x8071;
+    const Sfx *s = &sfx_table[id];
+    if (id == SFX_SPLASH && sfx_cur == SFX_BOOM && sfx_left) return;
+    sfx_left = 0;
+    sfx_stop();
+    REG_DMA1SAD = (u32)s->data;
+    REG_DMA1DAD = (u32)&REG_FIFO_A;
+    REG_DMA1CNT = DMA_ENABLE | DMA_AT_FIFO | DMA_REPEAT | DMA_32 | DMA_DST_FIXED;
+    REG_TM0D = -sfx_reload;
+    REG_TM0CNT = TM_ENABLE;
+    sfx_cur = id;
+    sfx_starts++;
+    sfx_left = s->frames;
 }
 
 /* Music: CH1 melody, CH2 harmony, CH3 bass. A tune is three lists of notes, one entry per row, all stepped
@@ -549,7 +580,7 @@ const Tune *volatile music;     /* NULL: none. Set last and cleared first, so VB
 volatile u16 music_row, music_wait;
 u16 music_last[3];              /* each channel's frequency value last written, 0 if silenced: those registers can't be read back */
 
-/* Off, each by its own way, and the notes in hand with them. An effect on CH4 is not touched. Retriggering at
+/* Off, each by its own way, and the notes in hand with them. A sample playing is not touched. Retriggering at
    envelope volume 0 turns a square channel off. */
 static void music_stop(void)
 {
@@ -659,6 +690,7 @@ static int menu(void)
         if (key_hit(KEY_SELECT)) {
             ai_level = (ai_level + 1) % 4;
             menu_level();
+            sfx_play(SFX_PING);
         }
     }
 }
@@ -737,13 +769,13 @@ static void cursor_show(void)
 static void shot_result(int r, int sunk, const char *who, const char *miss, const char *hit)
 {
     char b[24];
-    if (r == 0) { msg(miss); sound_tick(); return; }
-    if (r == 1) { msg(hit); sound_explosion(0); }
+    if (r == 0) { msg(miss); sfx_play(SFX_SPLASH); return; }
+    if (r == 1) { msg(hit); sfx_play(SFX_EXPLOSION); }
     else {
         strcpy(b, who);
         strcat(b, ship_name[sunk]);
         msg(strcat(b, " SUNK"));
-        sound_explosion(1);
+        sfx_play(SFX_BOOM);
     }
 }
 
@@ -938,7 +970,7 @@ static int fmt_u16(char *p, int v)
 static void splash(int won)
 {
     int f;
-    music_stop();               /* a shot's effect on CH4 rings on */
+    music_stop();               /* a shot's sample rings on */
     obj_hide(&obuf[0]);
     obj_hide(&obuf[1]);
     fade(1);

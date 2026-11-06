@@ -2,12 +2,15 @@
  * the game's state and press its buttons. One command a line, one reply line each:
  *   run N KEYS       N frames with the KEYS mask held (GBA bits: A 1, B 2, START 8...)
  *   peek ADDR N      N bytes as hex
- *   poke ADDR HEX    write bytes
+ *   poke ADDR HEX    write bytes; 2 or 4 aligned bytes as one write, which a DMA address register needs
  *   shot PATH        the screen, as a binary PPM
  *   reset            power-cycle the ROM; no save file is loaded, and libmgba keeps SRAM
  *   audio            the mixer's left output since the last audio: "samples peak rms"
  *   record PATH      also write that output to PATH, as raw signed 16-bit; "record -" stops
+ *   ds 0|1           leave Direct Sound A out of the mixer, or put it back. The ROM's own enable bits won't do
+ *                    for this: with them off libmgba stops the FIFO, so a sample pauses instead of playing on unheard
  */
+#include <mgba/flags.h>      /* before core.h: the struct mCore it declares depends on these */
 #include <mgba/core/blip_buf.h>
 #include <mgba/core/core.h>
 #include <mgba/core/log.h>
@@ -80,15 +83,23 @@ int main(int argc, char **argv)
             if (pcm_rec) fclose(pcm_rec);
             pcm_rec = strcmp(path, "-") ? fopen(path, "wb") : NULL;
             puts("ok");
+        } else if (sscanf(line, "ds %u", &n) == 1) {
+            core->enableAudioChannel(core, 4, n);
+            puts("ok");
         } else if (sscanf(line, "peek %x %u", &a, &n) == 2) {
             for (i = 0; i < n; i++) printf("%02x", core->busRead8(core, a + i));
             puts("");
         } else if (sscanf(line, "poke %x %7999s", &a, hex) == 2) {
-            for (i = 0; hex[i * 2]; i++) {
+            unsigned v = 0, len = strlen(hex) / 2;
+            for (i = 0; i < len; i++) {
                 unsigned b;
                 sscanf(hex + i * 2, "%2x", &b);
-                core->busWrite8(core, a + i, (uint8_t)b);
+                if (len == 2 && !(a & 1)) v |= b << (8 * i);
+                else if (len == 4 && !(a & 3)) v |= b << (8 * i);
+                else core->busWrite8(core, a + i, (uint8_t)b);
             }
+            if (len == 2 && !(a & 1)) core->busWrite16(core, a, v);
+            if (len == 4 && !(a & 3)) core->busWrite32(core, a, v);
             puts("ok");
         } else if (sscanf(line, "shot %4095s", path) == 1) {
             FILE *f = fopen(path, "wb");

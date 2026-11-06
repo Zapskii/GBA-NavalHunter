@@ -19,7 +19,8 @@ a preview in `tools/art.png`).
   own shots can differ from one run to the next if the timing does.
 - Game over: the win or lose picture and its jingle for 5 seconds (START or A skips both), then both fleets. START plays again.
 - Music is on the PSG: a tune on the title, a quiet loop while you place and fight, silent on the menu and end screen. Effects
-  stay on the noise channel, so music and effects never fight over one.
+  are samples on Direct Sound, one at a time: a splash, an explosion, a long boom for a sinking (a miss doesn't cut it) and a
+  sonar ping when SELECT changes the level. `tools/gen_sfx.py` synthesises them (standard library only) into `src/sfx_data.c`.
 
 Build with Docker (`devkitpro/devkitarm`): `make`. `make run` opens mGBA, `make test` checks the rules on the
 host, `make e2e` drives the real ROM headlessly. Not yet tested on real hardware.

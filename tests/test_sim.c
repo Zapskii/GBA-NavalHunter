@@ -13,6 +13,7 @@
 #include <string.h>
 #include "sim.h"
 #include "gfx.c"        /* tonc-free on purpose, so its rules are tested here against the same code */
+#include "sfx_data.c"   /* generated PCM: its promises are checked here */
 
 static int fails = 0;
 #define CHECK(cond, msg) do { if (!(cond)) { printf("FAIL: %s\n", msg); fails++; } } while (0)
@@ -549,6 +550,49 @@ static int fairness(uint8_t level, int games) {
 static int slices;
 static void count_slice(void) { slices++; }
 
+/* What tools/gen_sfx.py promises, which no run of the ROM can catch: a click at either end, or the DMA
+   reading past a sample's silence. */
+static void sfx_checks(void) {
+    const int8_t *const arr[4] = { sfx_splash, sfx_explosion, sfx_boom, sfx_ping };
+    const uint32_t size[4] = { sizeof sfx_splash, sizeof sfx_explosion, sizeof sfx_boom, sizeof sfx_ping };
+    const double frame = 280896.0 / sfx_reload;
+    uint32_t total = 0;
+    int k;
+    for (k = 0; k < 4; k++) {
+        const Sfx *s = &sfx_table[k];
+        const int8_t *d = s->data;
+        uint32_t i, end = 0, step_out = 0, end_top = 0, ramp = 1;
+        int peak = 0, low = 0;
+        CHECK(d == arr[k] && s->len == size[k], "sfx: the table's length is the array's");
+        CHECK(s->len % 4 == 0, "sfx: a whole number of DMA words");
+        for (i = 0; i < s->len; i++) {
+            int v = d[i], a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+            if (v < low) low = v;
+            if (v) end = i + 1;
+        }
+        CHECK(low > -128 && peak <= 127, "sfx: values in range, none at -128");
+        CHECK(peak >= 40 && peak < 127, "sfx: peak near the sample's level, not at full range");
+        total += s->len;
+        CHECK(d[0] == 0, "sfx: starts at exactly 0");
+        for (i = 1; i < 8; i++)
+            if (abs(d[i]) > peak * (int)i / 8 + 1) ramp = 0;
+        CHECK(ramp, "sfx: fades in over 8 samples at least, no click at the start");
+        for (i = end > 32 ? end - 32 : 1; i < end; i++) {
+            uint32_t a = (uint32_t)abs(d[i] - d[i - 1]), v = (uint32_t)abs(d[i]);
+            if (a > step_out) step_out = a;
+            if (v > end_top) end_top = v;
+        }
+        CHECK(step_out <= 8 && end_top <= 8, "sfx: fades out, no click at the end");
+        /* Stopped between frames - 1 and frames frames after the start, so all its sound must fit in the first... */
+        CHECK(end <= (s->frames - 1) * frame, "sfx: all of its sound plays before the earliest stop");
+        /* ...and from the latest the DMA, a FIFO and a request ahead, must still be reading this silence. */
+        CHECK(s->len >= s->frames * frame + 48, "sfx: silence past the latest stop and the read-ahead");
+    }
+    CHECK(total < 256 * 1024, "sfx: under 256 KB");
+    CHECK(sfx_reload == 1048, "sfx: the rate the generator made them for");
+}
+
 int main(int argc, char **argv) {
     Board b;
     uint8_t i, t;
@@ -822,6 +866,8 @@ int main(int argc, char **argv) {
         CHECK(same, "HARD picks the same shot in slices as in one go");
         CHECK(slices >= 2, "and the hook does run between the slices");
     }
+
+    sfx_checks();
 
     /* ---- ADMIRAL ---- */
     admiral_checks();

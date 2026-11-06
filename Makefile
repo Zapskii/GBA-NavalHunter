@@ -5,7 +5,7 @@
 #   make e2e    drive the real ROM headlessly in libmgba; screenshots in shots/
 
 ROM   = navalhunter.gba
-SRCS  = src/main.c src/gfx.c src/art.c
+SRCS  = src/main.c src/gfx.c src/art.c src/sfx_data.c
 DEPS  = $(wildcard src/*.h)
 RUN  := docker run --rm -u $(shell id -u):$(shell id -g) -v "$(CURDIR)":/work -w /work devkitpro/devkitarm
 BIN  := /opt/devkitpro/devkitARM/bin/arm-none-eabi-

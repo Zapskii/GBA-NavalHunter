@@ -9,6 +9,12 @@ DISPCNT, VRAM, OAM, PAL = 0x04000000, 0x06000000, 0x07000000, 0x05000000
 SND4ENV, SND4POLY, SNDSTAT, SND1ENV = 0x04000079, 0x0400007C, 0x04000084, 0x04000063
 SND1CNT, SND2CNT, SND3SEL, SND3CNT, SND4CNT, SND4FREQ = 0x04000062, 0x04000068, 0x04000070, 0x04000072, 0x04000078, 0x0400007C
 SNDDMGCNT, SNDDSCNT = 0x04000080, 0x04000082
+FIFO_A, DMA1SAD, DMA1DAD, DMA1CNT_H, TM0D, TM0CNT = 0x040000A0, 0x040000BC, 0x040000C0, 0x040000C6, 0x04000100, 0x04000102
+DMA_CNT_H = (0x040000BA, DMA1CNT_H, 0x040000D2, 0x040000DE)     # DMA 0 to 3
+DMA_FIFO = 0xB640           # on, FIFO timing, 32-bit, repeat, destination fixed
+SFX_SPLASH, SFX_EXPLOSION, SFX_BOOM, SFX_PING = range(4)
+SFX_NAMES = ("splash", "explosion", "boom", "ping")
+MIX_TOP = 511 * 48          # the end of the hardware's 10-bit mix, in the mixer's units: a byte is worth 4 of them at Direct Sound 100%, and measures 192
 ST_BOOT, ST_TITLE, ST_MENU, ST_PLACE, ST_BATTLE, ST_ENEMY, ST_END, ST_SPLASH = range(8)
 # The palette (C_*), hull segments (SEG_*) and cell art (T_*), as generated
 globals().update({n: int(v) for n, v in re.findall(r"(\w+) = (\d+)", open("src/art.h").read())})
@@ -740,13 +746,16 @@ def walk(e, t, loops, what, each=None):
 
 def mixer(e, n, mask=0xF):
     """The real mixer's output over n frames with only those channels let through, after 6 frames for the
-    change of mask to settle: the output filter takes a moment. (samples, peak, rms)."""
+    change of mask to settle: the output filter takes a moment. A mask of less than all four PSG channels shuts
+    Direct Sound out as well, so it asks about those channels alone. (samples, peak, rms)."""
     e.poke(SNDDMGCNT, bytes([0x77, mask | mask << 4]))
+    if mask != 0xF: e.cmd("ds 0")
     e.run(6)
     e.cmd("audio")
     e.run(n)
     got = e.cmd("audio").split()
     e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    e.cmd("ds 1")
     return int(got[0]), int(got[1]), float(got[2])
 
 def pitches(e, t, v):
@@ -853,31 +862,32 @@ def music_checks():
     frames_on = sum(any(battle["voice"][v][r] > REST for v in range(2)) for r in range(len(battle["voice"][0])))
     print(f"     battle loop: a melody or harmony note on {frames_on} of its {len(battle['voice'][0])} rows")
 
-    # --- effects on CH4, heard over the music
+    # --- effects on Direct Sound, heard over the music
     own_o = e.board("ob")[0]
     env = [t & 0xFFC0 for t in battle["cnt"][:2]]
-    for cell, a, b, what in ((water(own_o)[0], 0x21, 0x71, "miss"), (cells(own_o, 0)[0], 0xF3, 0x65, "hit"), (cells(own_o, 5)[0], 0xF7, 0x76, "sinking")):
+    for cell, id, what in ((water(own_o)[0], SFX_SPLASH, "miss"), (cells(own_o, 0)[0], SFX_EXPLOSION, "hit"), (cells(own_o, 5)[0], SFX_BOOM, "sinking")):
         e.battle_ready()
         e.goto(cell % 10, cell // 10)
         n0 = e.u32("jingle_notes")
-        e.poke(SNDDMGCNT, bytes([0x77, 0x88]))
+        e.poke(SNDDMGCNT, bytes([0x77, 0]))
+        e.poke(SND4CNT, bytes(2))               # the forced effect above: nothing may write CH4 from here on
         e.run(2, A); e.run(2); e.cmd("audio")
         e.run(8)
         before = e.cmd("audio").split()
         e.land()
-        got = e.peek(SND4CNT + 1)[0], e.peek(SND4FREQ)[0]
+        got = e.u8("sfx_cur"), e.reg(DMA1CNT_H), e.reg(SND4CNT)
         e.run(6)
         after = e.cmd("audio").split()
         e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
-        check(got == (a, b), f"{what}: its whole setup is on CH4, over the music: {got[0]:#x} {got[1]:#x}")
-        check(before[1] == "0" and int(after[1]) > 150, f"{what}: heard when the shell lands, CH4 alone through the mixer: peak {before[1]} in flight, {after[1]} on landing")
+        check(got == (id, DMA_FIFO, 0), f"{what}: its sample plays by DMA 1 over the music, nothing on CH4: {got}")
+        check(before[1] == "0" and int(after[1]) > 1500, f"{what}: heard when the shell lands, Direct Sound alone through the mixer: peak {before[1]} in flight, {after[1]} on landing")
         check(e.u32("music") == e.sym["tune_battle"], f"{what}: and the music plays on")
         e.battle_ready()
         e.run(200)                              # a bar and more: the loop is sparse
         check(e.u32("jingle_notes") > n0, f"{what}: its notes still counting: {n0} to {e.u32('jingle_notes')}")
         check(channel_regs(e)[:2] == env, f"{what}: with CH1 and CH2's setup untouched")
 
-    # --- your last shot, skipped: the loop stops, the effect rings on
+    # --- your last shot, skipped: the loop stops, the sample rings on
     last = last_one_alive(e, "ob", False)
     e.run(4)
     e.goto(last % 10, last // 10)
@@ -885,13 +895,13 @@ def music_checks():
     e.run(1, B); e.run(1)
     check(e.until(lambda: e.u32("music") == 0, 20), "the last ship sunk stops the loop")
     check(e.reg(SNDSTAT) & 7 == 0, f"CH1, CH2, CH3 go off at once: SNDSTAT {e.reg(SNDSTAT):#06x}")
-    check(e.reg(SNDSTAT) & 8 and e.peek(SND4CNT + 1)[0] == 0xF7, "and the sinking's CH4 effect is not cut")
+    check(e.reg(DMA1CNT_H) == DMA_FIFO and e.u8("sfx_cur") == SFX_BOOM, "and the sinking's sample is not cut")
     check(mixer(e, 5, 7)[1] == 0, "the mixer agrees: CH1-CH3 silent")      # the jingle is under 20 frames off
-    e.poke(SNDDMGCNT, bytes([0x77, 0x88]))
+    e.poke(SNDDMGCNT, bytes([0x77, 0]))
     e.run(2); e.cmd("audio"); e.run(2)
     got = e.cmd("audio").split()
     e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
-    check(int(got[1]) > 500 and e.u32("music") == 0, f"and CH4 sounding, before the jingle: peak {got[1]}")
+    check(int(got[1]) > 500 and e.u32("music") == 0, f"and it sounding, before the jingle: peak {got[1]}")
 
     # --- the win jingle, over the picture
     check(e.wait_state(ST_SPLASH, 60), "the win picture")
@@ -949,6 +959,269 @@ def music_checks():
     cost = e.u32("music_cycles")
     print(f"     music_step's worst, in the VBlank handler: {cost} cycles, of a frame's {FRAME_CYCLES}")
     check(cost < 1500, f"the note player costs next to nothing: {cost} cycles")
+    e.p.stdin.close(); e.p.wait()
+
+def sfx_table(e):
+    """The ROM's table: (data, length, frames) for each sample."""
+    t = e.peek(e.sym["sfx_table"], 48)
+    return [(int.from_bytes(t[k:k + 4], "little"), int.from_bytes(t[k + 4:k + 8], "little"), int.from_bytes(t[k + 8:k + 10], "little")) for k in range(0, 48, 12)]
+
+def force_sample(e, id):
+    """sfx_play by poke, for the mixes the game never reaches by itself: the loudest it could be."""
+    data, _, frames = sfx_table(e)[id]
+    e.poke(e.sym["sfx_left"], bytes(2))
+    e.poke(DMA1CNT_H, bytes(2)); e.poke(TM0CNT, bytes(2))
+    e.poke(SNDDSCNT, (0x0302 | 0x0800).to_bytes(2, "little"))
+    e.poke(DMA1SAD, data.to_bytes(4, "little")); e.poke(DMA1DAD, FIFO_A.to_bytes(4, "little"))
+    e.poke(DMA1CNT_H, DMA_FIFO.to_bytes(2, "little"))
+    e.poke(TM0D, (65536 - e.u16("sfx_reload")).to_bytes(2, "little")); e.poke(TM0CNT, bytes([0x80, 0]))
+    e.poke(e.sym["sfx_left"], frames.to_bytes(2, "little"))
+
+def recorded(e, n, keys=0):
+    """The mixer's samples over n frames, the first with keys down."""
+    os.makedirs("shots", exist_ok=True)
+    e.cmd("record shots/.pcm")
+    e.run(1, keys)
+    e.run(n - 1)
+    e.cmd("record -")
+    pcm = array.array("h")
+    pcm.frombytes(open("shots/.pcm", "rb").read())
+    os.remove("shots/.pcm")
+    return pcm
+
+def table_pcm(e, id):
+    data, length, _ = sfx_table(e)[id]
+    return [b - 256 if b > 127 else b for b in e.peek(data, length)]
+
+def pitch_of(w, rate_hz):
+    """A waveform's pitch from its rising crossings, ignoring wobbles near zero."""
+    band, ups, armed = max(map(abs, w)) / 4 if w else 0, [], False
+    for i, x in enumerate(w):
+        if x < -band: armed = True
+        elif x > band and armed: armed = False; ups.append(i)
+    return (len(ups) - 1) * rate_hz / (ups[-1] - ups[0]) if len(ups) > 2 else 0
+
+def hears_clean(what, pcm, data, per_sample):
+    """A sample's whole sound, alone: its table's bytes, settled on exactly 0, and no jump at the stop.
+    Through the mixer a byte is worth 96 at Direct Sound 50%, and per_sample mixer samples. The mixer's output is
+    high-passed, so "0" here can't see a stuck level: that the output really rests at 0 rests on the data, whose
+    silence tests/test_sim.c checks."""
+    table_peak = max(map(abs, data))
+    top = max(map(abs, pcm)) if pcm else 0
+    first = next((i for i, v in enumerate(pcm) if v), 0)
+    off = []
+    for k in range(0, len(data) - 800, 800):    # 50 ms at a time, the loudest in each against the table's
+        got = max(map(abs, pcm[first + int(k * per_sample):first + int((k + 800) * per_sample)]), default=0)
+        want = max(map(abs, data[k:k + 800])) * 96
+        if abs(got - want) > want * 0.25 + 300: off.append((k, got, want))
+    check(not off, f"{what}: through the mixer, its envelope is the table's every 50 ms: {off[:3]}")
+    last = max((i for i, v in enumerate(pcm) if v), default=0)
+    step = max((abs(pcm[i] - pcm[i - 1]) for i in range(max(1, last - 3000), last + 1)), default=0)    # its last 30 ms
+    print(f"     {what}: mixer peak {top} (table {table_peak}), DC after the stop {pcm[-1]}, biggest step in the last 30 ms {step}")
+    check(table_peak * 96 * 0.7 < top < table_peak * 96 * 1.3, f"{what}: heard at the table's level, Direct Sound alone: peak {top}")
+    check(all(v == 0 for v in pcm[-2000:]), f"{what}: after the stop the mixer sits at exactly 0: {max(map(abs, pcm[-2000:]))}")
+    check(step < 300, f"{what}: no click at the end: biggest step {step}")
+
+def sfx_checks():
+    e = Emu("navalhunter.gba")
+    e.run(10 + TIMING)
+    # --- the table
+    table, reload = sfx_table(e), e.u16("sfx_reload")
+    rate = 16777216 / reload
+    total = sum(t[1] for t in table)
+    check(15500 < rate < 16500, f"timer 0 reloads every {reload} cycles: {rate:.1f} Hz")
+    check(total < 256 * 1024, f"the samples total {total} bytes, under 256 KB")
+    for id, (data, length, frames) in enumerate(table):
+        name = SFX_NAMES[id]
+        check(data == e.sym["sfx_" + name] and data % 4 == 0 and length % 4 == 0, f"{name} is word-aligned for 32-bit DMA: {data:#x}, {length} bytes, {frames} frames")
+    os.makedirs("shots", exist_ok=True)
+    subprocess.run([sys.executable, "tools/gen_sfx.py", "shots/.sfx.c"], capture_output=True, check=True)
+    check(open("shots/.sfx.c").read() == open("src/sfx_data.c").read(), "tools/gen_sfx.py makes src/sfx_data.c byte for byte")
+    os.remove("shots/.sfx.c")
+
+    # --- what's in use: DMA 1, timer 0, and no other DMA to get in its way
+    check(e.reg(DMA1CNT_H) == 0 and e.reg(TM0CNT) == 0, "on the title, with no sample: DMA 1 off, timer 0 off")
+    check(e.reg(SNDDSCNT) == 0x0302, f"Direct Sound A both sides on timer 0, PSG mix kept at 100%, no reset left set: {e.reg(SNDDSCNT):#06x}")
+
+    # --- the loudest mixes, against the top of the mixer. A boom never plays over the title in the game
+    def loudest(what, loop):
+        top = 0
+        e.cmd("audio")
+        for _ in range(loop // 106 + 1):
+            force_sample(e, SFX_BOOM)
+            e.run(110)
+        top = int(e.cmd("audio").split()[1])
+        print(f"     a boom from {loop // 106 + 1} points over {what}: peak {top} of the mixer's {MIX_TOP}")
+        return top
+    title_top = loudest("the title tune", 960)
+    check(title_top < MIX_TOP, f"a boom over the title's level doesn't reach the top: {title_top}")
+    e.run(120)
+
+    # --- the menu: the ping, alone
+    e.run(1, START)
+    check(e.wait_state(ST_MENU, 40), "the menu")
+    e.cmd("audio"); e.run(30)
+    got = e.cmd("audio").split()
+    check(got[1] == "0", f"silent before any ping: peak {got[1]}")
+    sim0, frames0 = e.peek(e.sym["sim_state"], 4), table[SFX_PING][2]
+    e.poke(SNDDMGCNT, bytes([0x77, 0]))
+    e.run(6)                                    # the change of mask to settle, as in mixer()
+    # A stale FIFO, to prove the start resets it: without that, 32 loud bytes play before the ping.
+    for _ in range(8): e.poke(FIFO_A, bytes([0x7F] * 4))
+    n0 = e.u32("sfx_starts")
+    pcm = recorded(e, 2, SELECT)
+    on = e.reg(DMA1CNT_H), e.reg(TM0CNT), e.u8("sfx_cur"), e.u16("sfx_left")
+    check(on[:3] == (DMA_FIFO, 0x80, SFX_PING) and frames0 - 2 <= on[3] <= frames0, f"SELECT pings: DMA 1 in FIFO mode, timer on, {on[3]} frames to go: {on}")
+    check(e.u32("sfx_starts") == n0 + 1, "one sample started")
+    check(all(e.reg(a) == 0 for a in DMA_CNT_H if a != DMA1CNT_H), "and no other DMA is running to get in its way")
+    pcm += recorded(e, frames0 + 10)
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    first = next((i for i, v in enumerate(pcm) if v), 0)
+    head = max(map(abs, pcm[first:first + 180]))
+    check(head < 3500, f"the FIFO is reset at the start: nothing stale before the ping, peak {head} in its first 2 ms")
+    check(e.reg(DMA1CNT_H) == 0 and e.reg(TM0CNT) == 0 and e.u16("sfx_left") == 0, f"off after: DMA 1 {e.reg(DMA1CNT_H):#x}, timer {e.reg(TM0CNT):#x}")
+    check(e.reg(SNDDSCNT) == 0x0302, f"the reset bit isn't left set, the mix kept: {e.reg(SNDDSCNT):#06x}")
+    per_sample = len(pcm) / (frames0 + 12) * reload / FRAME_CYCLES
+    hears_clean("ping", pcm, table_pcm(e, SFX_PING), per_sample)
+    hz = pitch_of(pcm[first + 400:first + 3000], len(pcm) / (frames0 + 12) * 59.7275)
+    check(abs(hz / 1175 - 1) < 0.02, f"at the pitch it was made for, so the rate is right: {hz:.0f} Hz of 1175")
+    check(e.peek(e.sym["sim_state"], 4) == sim0, "a sample draws nothing from the generator")
+    e.run(6)                                    # the change of mask to settle, as in mixer()
+    e.cmd("audio"); e.run(30)
+    got = e.cmd("audio").split()
+    check(got[1] == "0", f"and the menu is silent again: peak {got[1]}")
+
+    # --- every sample whole and alone, by poke, so no next shot cuts it
+    e.poke(SNDDMGCNT, bytes([0x77, 0]))
+    e.run(6)
+    for id in (SFX_SPLASH, SFX_EXPLOSION, SFX_BOOM):
+        force_sample(e, id)
+        hears_clean(SFX_NAMES[id], recorded(e, table[id][2] + 12), table_pcm(e, id), per_sample)
+    e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+    e.run(6)
+
+    # --- a new start at every point of the old one: only the new count counts, and it ends clean
+    bad = None
+    for k in range(frames0 + 3):
+        e.run(1, SELECT); e.run(k + 1)
+        n0 = e.u32("sfx_starts")
+        pcm = recorded(e, 1, SELECT)
+        e.run(1)
+        late = e.u16("sfx_left"), e.reg(DMA1CNT_H)
+        n1 = e.u32("sfx_starts")
+        e.run(frames0 - 4)
+        mid = e.reg(DMA1CNT_H)
+        e.run(5)
+        if (n1 != n0 + 1 or late[1] != DMA_FIFO or late[0] < frames0 - 2 or mid != DMA_FIFO or e.reg(DMA1CNT_H) or e.u16("sfx_left")) and not bad:
+            bad = (k, n0, n1, late, mid, e.reg(DMA1CNT_H))
+    check(bad is None, f"SELECT again at each of {frames0 + 3} frames into a ping: plays its full length, and stops: {bad}")
+    check(e.u32("frame_drops") == 0, f"no frame dropped pinging ({e.u32('frame_drops')})")
+    while e.u8("ai_level") != 1: e.tap(SELECT)
+    e.run(frames0 + 2)
+
+    # --- a game: each sample whole, then who may cut whom
+    check(enter_battle(e), "into a battle")
+    battle_top = loudest("the battle loop", 1920)
+    check(battle_top < MIX_TOP, f"a boom over the battle loop doesn't reach the top: {battle_top}")
+    e.run(120)
+    own_o = e.board("ob")[0]
+    def arrange(enemy):
+        """Their board fresh, and every cell of yours spent but one, holding this hull or none: what the enemy's
+        next shot does, as it has nowhere else to fire."""
+        e.battle_ready()
+        e.until(lambda: e.u16("sfx_left") == 0, 120)
+        e.poke_board("ob", own_o, bytes(100), bytes(7), 7)
+        e.poke_board("pb", [enemy] + [EMPTY] * 99, [S_EMPTY] + [S_MISS] * 99, bytes(7), 7)
+        e.run(4)
+    target = {None: water(own_o)[0], SFX_EXPLOSION: cells(own_o, 0)[0], SFX_BOOM: cells(own_o, 5)[0]}
+    for id, what in ((SFX_SPLASH, None), (SFX_EXPLOSION, SFX_EXPLOSION), (SFX_BOOM, SFX_BOOM)):
+        arrange(EMPTY)
+        n0 = e.u32("jingle_notes")
+        e.goto(target[what] % 10, target[what] // 10)
+        e.run(2, A); e.run(2)
+        e.land()
+        check(e.u8("sfx_cur") == id and e.reg(DMA1CNT_H) == DMA_FIFO, f"{SFX_NAMES[id]}: plays on landing")
+        e.battle_ready()
+        e.run(200)
+        check(e.u32("jingle_notes") > n0, f"{SFX_NAMES[id]}: the music's note counter keeps moving")
+    # who cuts whom: your shot, then the enemy's answer, played straight and skipped
+    for name, yours, enemy, want, replaces in (("your hit, enemy's miss: the splash replaces it", SFX_EXPLOSION, EMPTY, SFX_SPLASH, True),
+                                               ("your sinking, enemy's miss: the boom is not cut", SFX_BOOM, EMPTY, SFX_BOOM, False),
+                                               ("your sinking, enemy's hit: the explosion replaces it", SFX_BOOM, 0, SFX_EXPLOSION, True),
+                                               ("your sinking, enemy's sinking: the boom starts again", SFX_BOOM, 5, SFX_BOOM, True)):
+        for skip in (False, True):
+            arrange(enemy)
+            i = target[yours]
+            e.goto(i % 10, i // 10)
+            e.run(2, A); e.run(2)
+            if skip: e.run(1, B); e.run(1)
+            else: e.land()
+            starts, left0 = e.u32("sfx_starts"), e.u16("sfx_left")
+            if not e.until(lambda: e.text("msg_text").startswith(("ENEMY", "YOUR ")), 120):
+                check(False, f"{name}: the enemy's answer lands"); continue
+            e.run(1)
+            cur, n, left, said = e.u8("sfx_cur"), e.u32("sfx_starts") - starts, e.u16("sfx_left"), e.text("msg_text")
+            full = table[want][2]
+            good = cur == want and (n == 1 and full - 3 <= left <= full if replaces else n == 0 and 0 < left < left0)
+            check(good and e.reg(DMA1CNT_H) == DMA_FIFO, f"{name}{', skipped' if skip else ''}: {said!r}, sample {cur}, starts +{n}, {left0} to {left} frames")
+            e.until(lambda: e.u16("sfx_left") == 0, 120)
+            e.poke(SNDDMGCNT, bytes([0x77, 0]))
+            e.run(6)
+            e.cmd("audio"); e.run(10)
+            got = e.cmd("audio").split()
+            e.poke(SNDDMGCNT, bytes([0x77, 0xFF]))
+            check(e.reg(DMA1CNT_H) == 0 and e.reg(TM0CNT) == 0 and got[1] == "0", f"{name}: and it stops at exactly 0: peak {got[1]}")
+    # a boom guards only while it plays: the last one above is over, so the next miss must splash
+    check(e.u8("sfx_cur") == SFX_BOOM and e.u16("sfx_left") == 0, "a boom has just finished")
+    arrange(EMPTY)
+    e.goto(target[None] % 10, target[None] // 10)
+    e.run(2, A); e.run(2)
+    e.land()
+    check(e.u8("sfx_cur") == SFX_SPLASH and e.reg(DMA1CNT_H) == DMA_FIFO, "and the next miss splashes")
+
+    # --- a boom over the win jingle, the loudest the game really plays, and the quickest way back to the menu
+    check(e.u32("frame_drops") == 0, f"no frame dropped through it all ({e.u32('frame_drops')})")
+    e.p.stdin.close(); e.p.wait()
+    e = Emu("navalhunter.gba")
+    e.run(10 + TIMING); e.tap(START); e.wait_state(ST_MENU, 40); enter_battle(e)
+    last = last_one_alive(e, "ob", False)
+    e.run(4)
+    e.goto(last % 10, last // 10)
+    e.cmd("audio")
+    e.run(2, A); e.run(2)
+    e.run(1, B); e.run(1)
+    check(e.u8("sfx_cur") == SFX_BOOM and e.reg(DMA1CNT_H) == DMA_FIFO, "the last shot's boom plays")
+    check(e.wait_state(ST_SPLASH, 60) and e.u16("sfx_left") > 0, f"and carries over the picture's start: {e.u16('sfx_left')} frames to go")
+    e.until(lambda: e.u32("music") == e.sym["tune_win"], 3)
+    e.run(200)
+    top = int(e.cmd("audio").split()[1])
+    print(f"     a boom over the win jingle, as the game plays it: peak {top} of the mixer's {MIX_TOP}")
+    check(top < MIX_TOP, f"it doesn't reach the top: {top}")
+    e.p.stdin.close(); e.p.wait()
+
+    e = Emu("navalhunter.gba")
+    e.run(10 + TIMING); e.tap(START); e.wait_state(ST_MENU, 40); enter_battle(e)
+    last = last_one_alive(e, "ob", False)
+    e.run(4)
+    e.goto(last % 10, last // 10)
+    e.run(2, A); e.run(2)
+    e.run(1, B); e.run(1)
+    f0 = e.u32("frames")
+    while e.state() != ST_END and e.u32("frames") - f0 < 300:
+        e.run(1, START); e.run(1)
+    f1 = e.u32("frames")
+    check(f1 - f0 < 120, f"(the skips are taken: the end screen after {f1 - f0} frames)")
+    while e.state() != ST_MENU and e.u32("frames") - f0 < 400:
+        e.run(1, START); e.run(1)
+    f2 = e.u32("frames")
+    print(f"     the quickest way from the boom to the menu: end screen {f1 - f0} frames, menu {f2 - f0}; the boom lasts {table[SFX_BOOM][2]}")
+    check(e.state() == ST_MENU and f2 - f0 > table[SFX_BOOM][2], f"mashing START, the boom ends before the menu's keys are live: {f2 - f0} v {table[SFX_BOOM][2]} frames")
+    check(e.u16("sfx_left") == 0 and e.reg(DMA1CNT_H) == 0 and e.reg(TM0CNT) == 0, f"DMA 1 and timer 0 are off on arrival: {e.u16('sfx_left')}")
+    e.cmd("audio"); e.run(60)
+    got = e.cmd("audio").split()
+    check(got[1] == "0", f"so the menu is exactly silent: peak {got[1]}")
+    check(all(e.reg(a) == 0 for a in DMA_CNT_H), f"and no DMA is left running anywhere: {[e.reg(a) for a in DMA_CNT_H]}")
+    check(e.u32("frame_drops") == 0, f"no frame dropped ({e.u32('frame_drops')})")
     e.p.stdin.close(); e.p.wait()
 
 def instant_randomise():
@@ -1162,7 +1435,7 @@ def main():
     check(st[hit] == S_HIT, f"shot at a known ship cell is a hit: st {st[hit]}")
     check(e.u16("shots_fired") == 1 and e.u16("shots_hit") == 1, "counted as a shot and a hit")
     check(e.text("msg_text") == "HIT!", f"message {e.text('msg_text')!r}")
-    check(e.peek(SND4ENV)[0] == 0xF3 and e.peek(SND4POLY)[0] == 0x65, "hit sound on the noise channel")
+    check(e.u8("sfx_cur") == SFX_EXPLOSION and e.reg(DMA1CNT_H) == DMA_FIFO, "hit: the explosion plays")
     check(e.u32("cells_drawn") - drawn == 1, f"a shot redraws one cell: {e.u32('cells_drawn') - drawn}")
     check(e.tiles(BIG)[hit] == T_HIT, "the hit cell is the hit mark on water, no hull")
     check(e.u32("frame_drops") == 0, "no frame dropped after the hit")
@@ -1187,12 +1460,13 @@ def main():
     # --- a known water cell is a miss
     miss = water(own_o)[0]
     drawn = e.u32("cells_drawn")
+    e.until(lambda: e.u16("sfx_left") == 0, 120)        # the enemy's answer may have sunk a sub, whose boom a miss won't cut
     e.shoot(miss); e.land()
     st = e.board("ob")[1]
     check(st[miss] == S_MISS, f"shot at known water is a miss: st {st[miss]}")
     check(e.u16("shots_fired") == 2 and e.u16("shots_hit") == 1, "counted as a shot, not a hit")
     check(e.text("msg_text") == "MISS", f"message {e.text('msg_text')!r}")
-    check(e.peek(SND4ENV)[0] == 0x21 and e.peek(SND4POLY)[0] == 0x71, "miss tick on the noise channel")
+    check(e.u8("sfx_cur") == SFX_SPLASH and e.reg(DMA1CNT_H) == DMA_FIFO, "miss: the splash plays")
     check(e.tiles(BIG)[miss] == T_MISS, "the miss cell is the miss mark")
     e.shot("9-miss")
     check(e.battle_ready(), "turn comes back after the miss")
@@ -1213,7 +1487,7 @@ def main():
     row0 = e.panel_row(5)
     e.shoot(sub); e.land()
     check(e.text("msg_text") == "SUB SUNK", f"message {e.text('msg_text')!r}")
-    check(e.peek(SND4ENV)[0] == 0xF7 and e.peek(SND4POLY)[0] == 0x76, "sunk sound on the noise channel")
+    check(e.u8("sfx_cur") == SFX_BOOM and e.reg(DMA1CNT_H) == DMA_FIFO, "sunk: the boom plays")
     e.run(4)
     check(e.tiles(BIG)[sub] == T_SUNK + SEG_BOAT, "the sunk cell now shows its hull, wrecked")
     row = e.panel_row(5)
@@ -1590,6 +1864,7 @@ def main():
     check(fleets[0][:100] != fleets[0][100:], "and the two fleets of one game differ")
 
     music_checks()
+    sfx_checks()
     instant_randomise()
     animation_checks()
     whole_games()
