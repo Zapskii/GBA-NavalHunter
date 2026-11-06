@@ -21,7 +21,7 @@ boards are always on screen, every shell flies, and the top level plays against 
 
 ## How it plays
 
-Each side has seven ships: a carrier, a battleship, a cruiser, two destroyers and two subs. Ships may not touch, so
+Each side has seven ships, of lengths 5, 4, 3, 2, 2, 1 and 1. Ships may not touch, so
 the cells around a sunk ship can't hold anything: they show as dotted water and can't be fired at. A ring is a miss
 and a spiked cross a hit. Firing at a spent square costs no turn.
 
@@ -29,9 +29,12 @@ Your board, with the enemy's last shot marked, is on the right, over the list of
 
 The computer plays fair at every level: it sees only what you could see, and a test pins that.
 
+EASY, NORMAL and HARD all try the squares around a hit and follow the line once they have one. They differ in how
+they hunt:
+
 - **EASY** fires at random.
-- **NORMAL** fires at random clear of known ships, tries the squares around a hit, and follows the line once it has one.
-- **HARD** does the same, but hunts at the square the most still-possible ship placements would cover.
+- **NORMAL** fires at random, but clear of the ships it has already found.
+- **HARD** fires at the square the most still-possible ship placements would cover.
 - **ADMIRAL** samples whole fleets that fit everything it has seen and fires where most of them have a ship. It also
   deals its own fleet with some care, instead of at random, before you do anything.
 
